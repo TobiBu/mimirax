@@ -1,0 +1,60 @@
+repos:
+  - repo: https://github.com/psf/black-pre-commit-mirror
+    rev: 26.5.1
+    hooks:
+      - id: black
+
+  - repo: https://github.com/PyCQA/isort
+    rev: 9.0.1
+    hooks:
+      - id: isort
+
+  - repo: https://github.com/jsh9/pydoclint
+    rev: 0.9.1
+    hooks:
+      - id: pydoclint
+        # Config lives in pyproject.toml so that
+        # `pydoclint --config pyproject.toml mimirax/` reproduces the hook exactly.
+        # Scoped to the package: tests/ and bench/ carry prose-only docstrings.
+        files: ^mimirax/
+        args: ["--config", "pyproject.toml"]
+
+  - repo: https://github.com/PyCQA/flake8
+    rev: 7.3.0
+    hooks:
+      - id: flake8
+        # UNDEFINED NAMES ONLY -- not a style linter. black, isort and pydoclint
+        # cannot see a name that is used but never imported, and with
+        # `from __future__ import annotations` in every module an unimported name
+        # inside an annotation is never evaluated either (jaccpot shipped three
+        # such defects through a green gate). `--builtins` is the jaxtyping axis
+        # vocabulary: a single-identifier axis such as `Float[Array, "n"]` reads
+        # to pyflakes as a forward reference to `n`.
+        #
+        #     n   particles / parameters      m   data points
+        #     t   targets                     k   sample or trace index
+        #     d   generic dimension
+        args:
+          [
+            "--select=F821,F822",
+            "--builtins=n,m,t,k,d",
+          ]
+
+  - repo: local
+    hooks:
+      - id: pyright
+        name: pyright
+        # Runs from the active environment. If pyright is not on PATH the check is
+        # skipped locally with a message rather than failing the commit; CI
+        # installs ".[dev]" and enforces it there.
+        entry: "bash -c 'command -v pyright >/dev/null 2>&1 && exec pyright mimirax || echo \"[pre-commit] pyright not on PATH; skipped locally (enforced in CI). Run: pip install -e .[dev]\"'"
+        language: system
+        types: [python]
+        pass_filenames: false
+      - id: pytest
+        name: pytest
+        entry: env
+        language: system
+        pass_filenames: false
+        args: ["JAX_ENABLE_X64=1", "pytest", "-q"]
+        stages: [manual]

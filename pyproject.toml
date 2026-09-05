@@ -1,0 +1,146 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mimirax"
+version = "0.0.1"
+description = "JAX-native inference and reconstruction layer for differentiable N-body forward models"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [
+  { name = "AstroAI Lab", email = "astroai@iwr.uni-heidelberg.de" },
+  { name = "Tobias Buck", email = "tobias.buck@iwr.uni-heidelberg.de" },
+]
+maintainers = [{ name = "AstroAI Lab", email = "astroai@iwr.uni-heidelberg.de" }]
+keywords = ["inference", "n-body", "jax", "gravity", "made-to-measure", "differentiable"]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Physics",
+]
+dependencies = [
+  # jaxlib must track jax (the nornax note applies: a mismatched floor lets the
+  # resolver pair an old jaxlib with a new jax and break jaxtyping at import).
+  # No upper bound: mimirax has no Pallas kernel or collective that pins an XLA
+  # behaviour, and it must co-install beside jaccpot's `>=0.10.2,<0.11` window
+  # and nornax's `>=0.8.0` floor.
+  "jax>=0.8.0",
+  "jaxlib>=0.8.0",
+  "jaxtyping>=0.2.34",
+  "beartype>=0.14.0",
+  # The gradient-based inference methods are written against optax's
+  # GradientTransformation, so it is a core dependency, not solver glue.
+  "optax>=0.2.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/TobiBu/mimirax"
+Repository = "https://github.com/TobiBu/mimirax"
+Issues = "https://github.com/TobiBu/mimirax/issues"
+Documentation = "https://tobias-buck.de/mimirax/"
+
+[project.optional-dependencies]
+# Solver glue lives behind extras so the core never imports a solver. None of
+# these packages is on PyPI yet: install the sibling from GitHub first (see
+# README "Installation"), then the extra resolves against what is installed.
+jaccpot = ["jaccpot>=0.0.1,<0.1.0"]
+nornax = ["nornax>=0.0.1,<0.1.0"]
+odisseo = ["odisseo>=0.1.0"]
+dev = [
+  # black, isort and pydoclint are pinned to exactly the .pre-commit-config.yaml
+  # hook revs, for the reason jaccpot records: a floating ">=" lets a local run
+  # and the hook disagree about what is clean. Bump them together.
+  "black==26.5.1",
+  "isort==9.0.1",
+  "pydoclint==0.9.1",
+  # pyright is pinned because it IS gated here (unlike jaccpot, where it is
+  # not): a scaffold starts at zero errors, so the gate costs nothing, and an
+  # unpinned checker would move the goalposts on its own.
+  "pyright==1.1.411",
+  "flake8>=7.3.0",
+  "pytest>=8.3.0",
+  "pytest-cov>=5.0.0",
+  "pre-commit>=3.8.0",
+  "build>=1.2.2",
+  "twine>=5.1.1",
+]
+docs = [
+  "sphinx>=7.0",
+  "furo>=2024.1.29",
+  "myst-parser>=2.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mimirax*"]
+
+[tool.setuptools.package-data]
+mimirax = ["py.typed"]
+
+[tool.black]
+line-length = 88
+target-version = ["py311", "py312", "py313"]
+include = "\\.pyi?$"
+exclude = '''
+/(
+  \.git
+ |\.venv
+ |build
+ |dist
+)/
+'''
+
+[tool.isort]
+profile = "black"
+line_length = 88
+skip_gitignore = true
+
+[tool.pydoclint]
+style = "numpy"
+# Read DOC noqa comments at the `def` line (jaccpot's setting, for the same
+# reason: a method checked against its class docstring has nowhere else to put
+# a suppression).
+native-mode-noqa-location = "definition"
+exclude = '\.git|\.venv|\.claude|build|dist'
+# The upstream default (`true`) skips argument and return checking on any
+# one-line docstring, which is exactly the shape every undocumented function
+# has; jaccpot measured 0 violations under the default against 560 with it off.
+# Off from day one here, so there is never a backlog to baseline.
+skip-checking-short-docstrings = false
+
+[tool.pyright]
+# Scoped to the package; tests/ and bench/ are not checked, as in the siblings.
+include = ["mimirax"]
+pythonVersion = "3.11"
+# Set explicitly so a pyright release that moves its default mode cannot
+# silently change what this reports.
+typeCheckingMode = "standard"
+# The optional solver adapters import packages that are not installed in CI.
+# Those imports are guarded at runtime; pyright must not fail the gate on them.
+reportMissingImports = false
+reportMissingModuleSource = false
+
+[tool.pytest.ini_options]
+minversion = "7.4"
+testpaths = ["tests"]
+addopts = "-q --strict-markers --cov=mimirax --cov-report=term-missing --cov-report=xml --cov-fail-under=80"
+
+[tool.coverage.run]
+source = ["mimirax"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_empty = true
+fail_under = 80
+exclude_lines = [
+  "pragma: no cover",
+  "if TYPE_CHECKING:",
+  "if __name__ == .__main__.:",
+]

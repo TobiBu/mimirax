@@ -1,4 +1,8 @@
-"""Hand-authored SVG logo drafts for mimirax, to the A2.3 style spec.
+"""The mimirax logo, drawn as SVG primitives: an eye whose iris is a set of inference contours.
+
+Chosen by TB on 2026-09-06 from three drafts (the well, root into water, the eye) and three eye
+variants; this file keeps only the chosen form. ``python assets/make_logo.py .`` regenerates the
+two SVGs at the repo root; the PNG is a 1024x1024 render of ``mimirax.svg``.
 
 Geometry is written out as SVG primitives (ellipses, paths, circles) by this
 script; nothing is traced or rasterised. Deterministic starfield from a fixed
@@ -160,126 +164,39 @@ def svg(body, view="0 0 1024 1024", size=1024):
 
 CX, CY = 512, 420
 
+# --- The eye: lid, an iris of contours tightening toward the pupil, the flare as the pupil -------
+LENS_HW, LENS_BULGE = 300, 165
 
-# --- Draft A: the well --------------------------------------------------------------------
-def draft_a(favicon=False):
-    b = ""
-    rx, ry = 300, 150
+
+def lens_path(cx=CX, cy=CY, hw=LENS_HW, bulge=LENS_BULGE):
+    return (
+        f"M{cx - hw} {cy} Q{cx} {cy - bulge * 2} {cx + hw} {cy} "
+        f"Q{cx} {cy + bulge * 2} {cx - hw} {cy} Z"
+    )
+
+
+def eye_c1(favicon=False):
+    """The iris rings tighten geometrically toward the pupil: a posterior concentrating on its mode.
+
+    ``favicon=True`` is the small-size form: lid, two rings and a dot, heavier strokes, no bloom.
+    """
+    b = "" if favicon else starfield(CX, CY, 360, seed=23, avoid_y=760)
+    b += f'  <circle cx="{CX}" cy="{CY}" r="150" fill="url(#pool)"/>\n'
     if favicon:
-        # The small-size form: the rim, two contours and the centre, drawn heavier and
-        # without the wide bloom, so that 32 px keeps three rings and 16 px keeps a
-        # ring and a dot instead of a smear.
-        b += f'  <ellipse cx="{CX}" cy="{CY}" rx="{rx}" ry="{ry}" fill="url(#pool)"/>\n'
         b += glow_path(
-            ellipse_path(CX, CY, rx, ry),
-            core=9,
-            halo=22,
-            bloom=0,
-            core_color=WHITE,
-            bloom_op=0,
+            lens_path(), core=9, halo=22, bloom=0, core_color=WHITE, bloom_op=0
         )
-        for f in (0.58, 0.27):
+        for r in (150, 78):
             b += glow_path(
-                ellipse_path(CX, CY, rx * f, ry * f),
-                core=8,
-                halo=18,
-                bloom=0,
-                bloom_op=0,
+                ellipse_path(CX, CY, r, r), core=8, halo=18, bloom=0, bloom_op=0
             )
-        b += f'  <circle cx="{CX}" cy="{CY}" r="80" fill="url(#flare)"/>\n'
+        b += f'  <circle cx="{CX}" cy="{CY}" r="70" fill="url(#flare)"/>\n'
         b += f'  <circle cx="{CX}" cy="{CY}" r="16" fill="{WHITE}"/>\n'
         return b
-    b += starfield(CX, CY, 360, avoid_y=760)
-    # pool
-    b += f'  <ellipse cx="{CX}" cy="{CY}" rx="{rx}" ry="{ry}" fill="url(#pool)"/>\n'
-    # well wall: lower rim offset down, joined by short verticals (a cylinder mouth seen from above-front)
-    depth = 52
-    b += glow_path(
-        ellipse_path(CX, CY + depth, rx, ry, 0, 180),
-        core=3,
-        halo=12,
-        bloom=28,
-        core_op=0.55,
-        halo_op=0.4,
-        bloom_op=0.25,
-    )
-    b += glow_path(
-        f"M{CX - rx} {CY} L{CX - rx} {CY + depth} M{CX + rx} {CY} L{CX + rx} {CY + depth}",
-        core=3,
-        halo=12,
-        bloom=28,
-        core_op=0.55,
-        halo_op=0.4,
-        bloom_op=0.25,
-    )
-    # rim
-    b += glow_path(
-        ellipse_path(CX, CY, rx, ry), core=4.5, halo=18, bloom=44, core_color=WHITE
-    )
-    # ripples: contour levels converging on the centre -- spacing shrinks inward
-    for f, op in [(0.78, 0.9), (0.58, 0.85), (0.41, 0.8), (0.27, 0.75), (0.15, 0.7)]:
-        b += glow_path(
-            ellipse_path(CX, CY, rx * f, ry * f),
-            core=3,
-            halo=11,
-            bloom=26,
-            core_op=op,
-            halo_op=0.5 * op,
-            bloom_op=0.3 * op,
-        )
-    b += flare(CX, CY, r=64, arm=130)
-    b += wordmark(512, 862)
-    return b
-
-
-# --- Draft B: root into water --------------------------------------------------------------
-def draft_b():
-    b = starfield(CX, 380, 380, seed=11, avoid_y=760)
-    surf_y = 470
-    # root: main taper with two rootlets, descending from the top edge of the motif band
-    root = f"M512 120 C 496 190, 534 250, 512 {surf_y}"
-    rootlet_l = f"M512 250 C 470 280, 440 330, 430 {surf_y}"
-    rootlet_r = f"M512 300 C 560 330, 585 380, 590 {surf_y}"
-    b += glow_path(root, core=5, halo=16, bloom=36, core_color=WHITE)
-    b += glow_path(rootlet_l, core=3, halo=11, bloom=26, core_op=0.8)
-    b += glow_path(rootlet_r, core=3, halo=11, bloom=26, core_op=0.8)
-    # water surface
-    b += f'  <ellipse cx="{CX}" cy="{surf_y + 60}" rx="330" ry="120" fill="url(#pool)"/>\n'
-    b += glow_path(
-        f"M{CX - 320} {surf_y} L{CX + 320} {surf_y}",
-        core=4,
-        halo=16,
-        bloom=40,
-        core_color=WHITE,
-    )
-    # ripples below the surface: lower half-ellipses, the reflection of the contours
-    for rx_, f in [(60, 0.95), (125, 0.85), (200, 0.7), (285, 0.5)]:
-        b += glow_path(
-            ellipse_path(CX, surf_y, rx_, rx_ * 0.42, 0, 180),
-            core=3,
-            halo=11,
-            bloom=26,
-            core_op=f,
-            halo_op=0.5 * f,
-            bloom_op=0.3 * f,
-        )
-    b += flare(CX, surf_y, r=56, arm=120)
-    b += wordmark(512, 862)
-    return b
-
-
-# --- Draft C: the eye -------------------------------------------------------------------------
-def draft_c():
-    b = starfield(CX, CY, 360, seed=23, avoid_y=760)
-    hw, bulge = 300, 165
-    lens = (
-        f"M{CX - hw} {CY} Q{CX} {CY - bulge * 2} {CX + hw} {CY} "
-        f"Q{CX} {CY + bulge * 2} {CX - hw} {CY} Z"
-    )
-    b += f'  <circle cx="{CX}" cy="{CY}" r="150" fill="url(#pool)"/>\n'
-    b += glow_path(lens, core=4.5, halo=18, bloom=44, core_color=WHITE)
-    # iris: concentric circles = contour levels; a rune-like tick at the four cardinal points
-    for r, op in [(150, 0.9), (112, 0.85), (78, 0.8), (48, 0.75)]:
+    b += glow_path(lens_path(), core=4.5, halo=18, bloom=44, core_color=WHITE)
+    # radii shrink by a constant factor: equal steps in log-radius, the look of a Gaussian's
+    # nested credible regions
+    for r, op in [(150, 0.9), (104, 0.85), (72, 0.8), (50, 0.75), (35, 0.7)]:
         b += glow_path(
             ellipse_path(CX, CY, r, r),
             core=3,
@@ -289,21 +206,13 @@ def draft_c():
             halo_op=0.5 * op,
             bloom_op=0.3 * op,
         )
-    ticks = " ".join(
-        f"M{CX + 150 * math.cos(a):.1f} {CY + 150 * math.sin(a):.1f} L{CX + 172 * math.cos(a):.1f} {CY + 172 * math.sin(a):.1f}"
-        for a in [math.radians(d) for d in (90, 270)]
-    )
-    b += glow_path(ticks, core=3, halo=10, bloom=22, core_op=0.8)
-    b += flare(CX, CY, r=44, arm=90)
+    b += flare(CX, CY, r=40, arm=84)
     b += wordmark(512, 862)
     return b
 
 
-(OUT / "draft-a-well.svg").write_text(svg(draft_a()))
-(OUT / "draft-b-root.svg").write_text(svg(draft_b()))
-(OUT / "draft-c-eye.svg").write_text(svg(draft_c()))
-# favicon: motif-only square crop of draft A, outer bloom dropped by the smaller canvas
-(OUT / "favicon-a-well.svg").write_text(
-    svg(draft_a(favicon=True), view="192 100 640 640", size=640)
+(OUT / "mimirax.svg").write_text(svg(eye_c1()))
+(OUT / "mimirax-favicon.svg").write_text(
+    svg(eye_c1(favicon=True), view="192 100 640 640", size=640)
 )
-print("wrote", sorted(p.name for p in OUT.iterdir()))
+print("eye variants written")

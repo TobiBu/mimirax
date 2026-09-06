@@ -214,6 +214,7 @@ class Reparameterization(Protocol):
         Array
             The constrained values, same shape.
         """
+        ...
 
     def inverse(self, constrained: Array) -> Array:
         """Map constrained values back to the unconstrained space.
@@ -228,6 +229,7 @@ class Reparameterization(Protocol):
         Array
             The unconstrained values, same shape.
         """
+        ...
 
     def log_abs_det_jacobian(self, unconstrained: Array) -> Scalar:
         """Return ``log abs det J`` of :meth:`forward` at ``unconstrained``.

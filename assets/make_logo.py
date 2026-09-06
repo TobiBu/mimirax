@@ -215,4 +215,4 @@ def eye_c1(favicon=False):
 (OUT / "mimirax-favicon.svg").write_text(
     svg(eye_c1(favicon=True), view="192 100 640 640", size=640)
 )
-print("eye variants written")
+print("wrote mimirax.svg and mimirax-favicon.svg")

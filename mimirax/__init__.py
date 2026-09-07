@@ -31,6 +31,7 @@ from .inference import (  # noqa: E402
     NelderMead,
     OptaxOptimizer,
     adam,
+    made_to_measure,
 )
 from .likelihoods import LIKELIHOODS, GaussianLikelihood, chi_squared  # noqa: E402
 from .observables import (  # noqa: E402
@@ -125,6 +126,7 @@ __all__ = [
     "fisher_information",
     "has_converged",
     "log_abs_det_jacobian",
+    "made_to_measure",
     "make_observable",
     "net_momentum",
     "normalized_residuals",

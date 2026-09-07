@@ -296,8 +296,10 @@ def test_tracer_recovery_from_uniform_weights(key) -> None:
     Those numbers together *are* the result: the fit is essentially perfect and
     the weights are not recovered, because ten numbers cannot determine
     sixty-four. The Fisher information says it exactly. Its smallest eigenvalue
-    is ``mu = 1e-3`` to machine precision -- the entropy prior's own curvature
-    ``mu / w``, with no contribution from the data at all -- and only **nine**
+    **is** ``mu = 1e-3`` -- the entropy prior's own curvature ``mu / w``, with no
+    contribution from the data at all, asserted to ``1e-6`` relative because
+    ``eigh``'s own round-off differs by ~1e-9 between platforms -- and only
+    **nine**
     eigenvalues rise above ``1e-3`` of the largest (5.78e1 to 2.57e4), so
     :func:`~mimirax.degenerate_directions` reports **55** degenerate directions
     out of 64. Along those the answer is the prior's, which is what an entropy
@@ -331,7 +333,7 @@ def test_tracer_recovery_from_uniform_weights(key) -> None:
 
     fisher = fisher_information(over_weights, start["weights"])
     eigenvalues, directions = degenerate_directions(fisher, rtol=1.0e-3)
-    assert float(eigenvalues[0]) == pytest.approx(MU, rel=1e-8)
+    assert float(eigenvalues[0]) == pytest.approx(MU, rel=1e-6)
     assert directions.shape[1] == 55
 
 

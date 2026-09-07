@@ -382,9 +382,9 @@ def test_the_under_determined_problem_is_reported_as_such(degenerate_problem) ->
     The fit drives chi-squared to **2.5e-8** and still leaves the weights
     **23 %** away from the ones that made the data, because six numbers cannot
     determine twenty. The Fisher information says so exactly: at the uniform
-    start its smallest eigenvalue is ``mu`` to machine precision -- the entropy
-    prior's own curvature ``mu / w`` at ``w = 1`` -- so along those directions
-    the *data contribute nothing at all* and the prior alone decides the answer.
+    start its smallest eigenvalue **is** ``mu`` -- the entropy prior's own
+    curvature ``mu / w`` at ``w = 1`` -- so along those directions the *data
+    contribute nothing at all* and the prior alone decides the answer.
     Exactly **fourteen** directions are null: the time-averaged kernel has full
     rank 6 (singular values 4.43, 1.25, 0.671, 0.464, 0.226, 0.106 -- no
     redundancy among the six observables), so six directions carry information
@@ -395,13 +395,19 @@ def test_the_under_determined_problem_is_reported_as_such(degenerate_problem) ->
     under the threshold without being zero. Worth knowing before an ``rtol`` is
     read as a rank -- so both numbers are asserted below.
 
+    The bound on that smallest eigenvalue is ``1e-6`` relative, and the reason it
+    is not tighter is the eigensolver rather than the physics: ``eigh`` returns
+    ``mu`` to 7.6e-10 relative on darwin/arm64 and to 1.1e-9 on CI's linux
+    build. The claim under test is that the data contribute *nothing* along the
+    direction; 1e-6 states that without also asserting LAPACK's last bits.
+
     This is the diagnostic the module ships instead of a choice of observables
     that makes the recovery look good.
     """
     problem, truth, start, _, _ = degenerate_problem
     fisher = fisher_information(problem.negative_log_posterior, start)
     eigenvalues, directions = degenerate_directions(fisher, rtol=1.0e-3)
-    assert float(eigenvalues[0]) == pytest.approx(MU, rel=1e-9)
+    assert float(eigenvalues[0]) == pytest.approx(MU, rel=1e-6)
     assert directions.shape[1] >= 14
     assert directions.shape[1] == 15
 

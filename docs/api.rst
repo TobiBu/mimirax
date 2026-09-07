@@ -33,6 +33,10 @@ Observables, likelihoods and priors
    :members:
    :undoc-members:
 
+.. automodule:: mimirax.observables.m2m
+   :members:
+   :undoc-members:
+
 .. automodule:: mimirax.likelihoods
    :members:
    :undoc-members:

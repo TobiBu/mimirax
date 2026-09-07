@@ -1,8 +1,22 @@
-"""Priors and regularizers: a Gaussian, an L2 penalty, and the M2M entropy stub."""
+"""Priors and regularizers: a Gaussian, an L2 penalty, and the M2M entropy prior.
+
+WHERE THE JACOBIAN SITS. Every ``log_prob`` here is a density over the space it
+is *handed*, and none of them adds the log-Jacobian of a reparameterization.
+That is the scaffold's convention for :class:`GaussianPrior` and it is kept for
+:class:`EntropyPrior`: a caller who moves in an unconstrained space and wants a
+density over *that* space adds
+:func:`mimirax.parameters.log_abs_det_jacobian` itself. The alternative --
+folding the Jacobian into the prior -- would make the same prior mean two
+different things depending on which optimizer called it. This is friction 1 of
+the EDDA programme's D-027 and the choice is made here, once, explicitly:
+**priors are densities over the constrained parameters**, and
+:meth:`mimirax.inference.MadeToMeasure.minimize` evaluates its objective on
+constrained parameters for exactly that reason.
+"""
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
 import jax
@@ -109,38 +123,113 @@ class L2Regularizer:
 
 @dataclass(frozen=True)
 class EntropyPrior:
-    """The made-to-measure entropy prior, ``-mu * sum(w log(w / w0))``. Stub.
+    """The made-to-measure entropy prior over a positive weight vector.
 
-    Syer & Tremaine's regularizer keeps particle weights ``w`` close to their
-    priors ``w0``. It lands with the M2M module in
-    :mod:`mimirax.inference.m2m` (D-026 in the EDDA programme's decisions log).
+    Syer & Tremaine's (1996) regularizer keeps the particle weights ``w`` near a
+    reference ``w0``. Two spellings of it are in the literature and they do not
+    have the same mode, so both are here and the default is stated:
+
+    * ``include_linear_term=True`` (the default, Dehnen 2009's form)::
+
+          S = -sum_i w_i * (log(w_i / w0_i) - 1)
+
+      whose gradient is ``dS/dw_i = -log(w_i / w0_i)``. It vanishes at
+      ``w = w0``, so the prior's mode is the reference **unconditionally**.
+    * ``include_linear_term=False`` (Syer & Tremaine's own ``S = -sum w log(w /
+      w0)``), whose gradient is ``-(log(w_i / w0_i) + 1)`` and therefore
+      vanishes at ``w = w0 / e``. Its mode is the reference only *on* the
+      constant-total-weight surface that
+      :class:`mimirax.parameters.TotalMassConstraint` fixes, where the Lagrange
+      multiplier absorbs the constant.
+
+    Both are strictly concave on ``w > 0`` -- the Hessian is the negative
+    diagonal ``-mu / w_i`` for either -- so the term can only ever pull a fit
+    toward the reference, never create a second optimum. ``log_prob`` returns
+    ``mu * S``, the *log density*, so it adds to a likelihood the way every
+    other :class:`~mimirax.protocols.Prior` here does; the ``mu S`` term of the
+    made-to-measure objective is exactly this, and ``mu`` lives here and nowhere
+    else (:class:`~mimirax.inference.MadeToMeasure` deliberately has no second
+    copy of it).
+
+    **Domain.** The entropy is defined on ``w > 0`` and this returns ``nan``
+    outside it, deliberately: the package's rule is that positivity is enforced
+    by a reparameterization (:class:`mimirax.parameters.LogTransform`), not by
+    clipping inside a density, and a silent ``where``-guard here would hide a
+    parameterization mistake instead of failing on it.
 
     Attributes
     ----------
     mu : float
-        Regularization strength.
+        Regularization strength; scales the whole term linearly.
+    reference : Array | float | None
+        ``w0``. A scalar or an ``(n,)`` array; ``None`` means the uniform
+        reference ``1``, so the mode is the all-ones weight vector. A system of
+        total weight ``M`` on ``n`` particles wants ``reference=M / n``.
+    key : str | None
+        Which leaf of a mapping ``params`` holds the weights. With ``None`` the
+        prior is applied to every leaf, as :class:`GaussianPrior` is; a
+        non-``None`` key (the default ``"weights"``) is what keeps the prior off
+        the position and velocity leaves of a made-to-measure parameter dict,
+        where a logarithm would be a domain error rather than a regularizer.
+    include_linear_term : bool
+        Whether to use the ``-1`` shifted form whose mode is the reference; see
+        above.
     """
 
     mu: float = 1.0
+    reference: Array | float | None = None
+    key: str | None = "weights"
+    include_linear_term: bool = True
 
-    def log_prob(self, params: PyTree) -> Scalar:
-        """Not implemented yet.
+    def _leaf(self, weights: Array) -> Scalar:
+        """Return ``mu * S`` for one weight leaf.
 
         Parameters
         ----------
-        params : PyTree
-            The particle weights.
+        weights : Array
+            Strictly positive weights.
 
         Returns
         -------
         Scalar
-            Never returns.
+            The leaf's contribution to the log prior density.
+        """
+        w = jnp.asarray(weights)
+        reference = jnp.ones_like(w) if self.reference is None else self.reference
+        ratio = jnp.log(w / reference)
+        if self.include_linear_term:
+            ratio = ratio - 1.0
+        return -self.mu * jnp.sum(w * ratio)
+
+    def log_prob(self, params: PyTree) -> Scalar:
+        """Return ``mu * S`` at ``params``, the entropy prior's log density.
+
+        Parameters
+        ----------
+        params : PyTree
+            The particle weights: a mapping carrying :attr:`key`, or any pytree
+            whose leaves are all weights when :attr:`key` is ``None``.
+
+        Returns
+        -------
+        Scalar
+            ``-mu * sum(w * (log(w / w0) - 1))`` with the default
+            :attr:`include_linear_term`, and ``-mu * sum(w * log(w / w0))``
+            without it. ``nan`` where any weight is non-positive.
 
         Raises
         ------
-        NotImplementedError
-            Always, until the M2M module lands.
+        KeyError
+            If ``params`` is a mapping and :attr:`key` is not one of its keys.
+            The message lists the keys that are there, because the usual cause
+            is a parameter dict that spells the weights differently.
         """
-        raise NotImplementedError(
-            "EntropyPrior lands with the made-to-measure module (mimirax.inference.m2m)"
-        )
+        if self.key is not None and isinstance(params, Mapping):
+            if self.key not in params:
+                raise KeyError(
+                    f"EntropyPrior(key={self.key!r}) found no such leaf; params "
+                    f"has {tuple(params)}. Pass key=... or key=None to apply the "
+                    "prior to every leaf."
+                )
+            return self._leaf(params[self.key])
+        return _sum_over_leaves(params, self._leaf)

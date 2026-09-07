@@ -35,8 +35,11 @@ from .inference import (  # noqa: E402
 from .likelihoods import LIKELIHOODS, GaussianLikelihood, chi_squared  # noqa: E402
 from .observables import (  # noqa: E402
     OBSERVABLES,
+    GaussianRadialBins,
     IdentityObservable,
     ProjectedPositions,
+    TimeAverage,
+    WeightedKernelSum,
     make_observable,
 )
 from .parameters import (  # noqa: E402
@@ -83,6 +86,7 @@ __all__ = [
     "FunctionConstraint",
     "GaussianLikelihood",
     "GaussianPrior",
+    "GaussianRadialBins",
     "HMC",
     "IdentityObservable",
     "IdentityTransform",
@@ -109,7 +113,9 @@ __all__ = [
     "SampleResult",
     "Sampler",
     "SoftplusTransform",
+    "TimeAverage",
     "TotalMassConstraint",
+    "WeightedKernelSum",
     "adam",
     "centre_of_mass",
     "chi_squared",

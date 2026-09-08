@@ -37,6 +37,7 @@ from mimirax import (
     TimeAverage,
     WeightedKernelSum,
     degenerate_directions,
+    effective_parameters,
     fisher_information,
     made_to_measure,
 )
@@ -341,36 +342,38 @@ def test_tracer_recovery_from_uniform_weights(key) -> None:
     """Item 3: recover 64 weights from five binned moments' time averages.
 
     Sixty-four weights against ten observables (five soft radial bins times two
-    moments), started from uniform, 10000 Adam steps at a learning rate of 0.02
-    through a 24-base-step rollout. What is reported is what was measured:
+    moments), started from uniform, through a 24-base-step rollout, **weights
+    only** -- the positions and velocities are fixed inputs and are asserted
+    unmoved. (They were not always: see
+    ``test_minimize_moves_the_weights_and_nothing_else``. Every number here is
+    a re-measurement after that fix.)
 
-    * chi-squared falls from **8.82e+03** to **5.35e-11**, so the time-averaged
-      observables are reproduced far below the assumed noise;
-    * the weights end **0.284** (relative L2) from the ones that made the data;
-    * every weight stays positive, the smallest being 0.918.
+    Measured, 200 LBFGS steps:
 
-    Those numbers together *are* the result: the fit is essentially perfect and
-    the weights are not recovered, because ten numbers cannot determine
-    sixty-four. The Fisher information says it exactly. Its smallest eigenvalue
-    **is** ``mu = 1e-3`` -- the entropy prior's own curvature ``mu / w``, with no
-    contribution from the data at all, asserted to ``1e-6`` relative because
-    ``eigh``'s own round-off differs by ~1e-9 between platforms -- and only
-    **nine**
-    eigenvalues rise above ``1e-3`` of the largest (5.78e1 to 2.57e4), so
-    :func:`~mimirax.degenerate_directions` reports **55** degenerate directions
-    out of 64. Along those the answer is the prior's, which is what an entropy
-    prior is for and what must not be reported as a recovery.
+    * chi-squared falls from **8.82e+03** to **1.36e-08**;
+    * the weights end **0.217** (relative L2) from the ones that made the data;
+    * every weight stays positive, the smallest being 0.666.
 
-    Choosing observables until the weight error looked small would have hidden
-    the structure of the problem. Whether a real made-to-measure target is
-    identifiable is a question for the experiment that poses it, and this is the
-    diagnostic that answers it there.
+    Those two numbers together are the result, and the reason is now measured
+    rather than asserted. The objective is **strictly convex** in the weights
+    (Hessian ``K̄Σ⁻¹K̄ᵀ + mu diag(1/w)``, smallest eigenvalue ``mu / max w > 0``),
+    so it has a **unique** minimiser, and 0.217 is that minimiser's distance
+    from the truth -- not an optimizer artefact, and not a point on a flat
+    valley. What makes it 0.217 rather than 0 is how much the data actually say:
+    :func:`~mimirax.effective_parameters` returns **9.9999**, i.e. the ten
+    observables determine ten degrees of freedom, and the other 54 are the
+    entropy prior's answer. The smallest Fisher eigenvalue *is* ``mu``, with no
+    contribution from the data at all.
+
+    No amount of optimizer, step size or ``mu`` tuning moves 9.9999. More
+    information means more or better observables, and that is the honest reading
+    of a made-to-measure fit whose chi-squared looks perfect.
     """
     problem, truth, start = _tracer_problem(key, n=64, num_steps=24)
     objective = problem.negative_log_posterior
 
     initial_chi2 = -2.0 * float(problem.log_likelihood(start))
-    fit = made_to_measure(learning_rate=0.02, num_steps=10000).minimize(
+    fit = MadeToMeasure(optimizer=optax.lbfgs(), num_steps=200).minimize(
         objective, start
     )
     final_chi2 = -2.0 * float(problem.log_likelihood(fit.params))
@@ -378,12 +381,15 @@ def test_tracer_recovery_from_uniform_weights(key) -> None:
         jnp.linalg.norm(fit.params["weights"] - truth) / jnp.linalg.norm(truth)
     )
     assert initial_chi2 > 1.0e3
-    assert final_chi2 < 1.0e-8, f"chi2 {initial_chi2:.3e} -> {final_chi2:.3e}"
+    assert final_chi2 < 1.0e-6, f"chi2 {initial_chi2:.3e} -> {final_chi2:.3e}"
     assert jnp.all(fit.params["weights"] > 0.0)
+    # Weights only: the initial conditions are inputs, not parameters.
+    for leaf in ("positions", "velocities"):
+        assert jnp.array_equal(fit.params[leaf], start[leaf]), leaf
     # The weight error stays large, and that is the reported result.
-    assert 0.15 < error < 0.5, f"weight error {error:.3e}"
+    assert 0.15 < error < 0.3, f"weight error {error:.3e}"
 
-    # The degeneracy that explains it, over the weights alone.
+    # Why it is large: the data determine ten degrees of freedom, not 64.
     def over_weights(weights):
         return objective({**start, "weights": weights})
 
@@ -392,6 +398,115 @@ def test_tracer_recovery_from_uniform_weights(key) -> None:
     assert float(eigenvalues[0]) == pytest.approx(MU, rel=1e-6)
     assert directions.shape[1] == 55
 
+    data_curvature = fisher_information(
+        lambda w: -problem.log_likelihood({**start, "weights": w}),
+        start["weights"],
+    )
+    prior_curvature = fisher_information(
+        lambda w: -problem.log_prior({**start, "weights": w}), start["weights"]
+    )
+    effective = float(effective_parameters(data_curvature, prior_curvature))
+    assert effective == pytest.approx(
+        problem.observed.size, rel=1.0e-3
+    ), f"the data determined {effective:.4f} of 64 weights"
+
+
+def test_the_tracer_objective_has_one_minimum_and_everything_agrees_on_it(
+    key,
+) -> None:
+    """Strictly convex in the weights, so Newton from anywhere finds the same point.
+
+    The correction that reorganised the rest of this file. The tracer objective
+    is ``½‖(K̄ᵀw − Y)/σ‖² − mu S(w)``: chi-squared is convex in ``w`` because the
+    model is *linear* in the weights, ``−mu S`` is convex because ``S`` is
+    concave, and the sum's Hessian ``K̄Σ⁻¹K̄ᵀ + mu diag(1/w)`` has smallest
+    eigenvalue ``mu / max w > 0``. So the minimiser is **unique** -- there is no
+    flat valley of stationary points, only a very anisotropic bowl with
+    condition number 2.6e+07.
+
+    Measured: a damped Newton iteration in ``log w`` from four starting points
+    (uniform, half the truth, twice the truth, random) reaches the same weights
+    to **1.2e-15** relative, with the objective identical to twelve digits
+    (-6.328701800494e-02) and ``|dF/dw|`` of order 1e-11.
+
+    This is why the earlier reading of this suite was wrong. The spread between
+    optimizers -- weight errors from 0.246 to 2.409 in one table -- was **not**
+    different optimizers stopping at different valid optima. It was
+    non-convergence along the low-curvature directions of a single bowl, made
+    much worse by the over-parameterisation defect. With that fixed and a
+    quasi-Newton rule, every method that converges lands on the same answer.
+    """
+    problem, truth, start = _tracer_problem(key, n=64, num_steps=24)
+    objective = problem.negative_log_posterior
+
+    def over_weights(weights):
+        return objective({**start, "weights": weights})
+
+    # Strict convexity, at three unrelated points.
+    for weights in (
+        start["weights"],
+        truth,
+        0.3 + 2.0 * jax.random.uniform(jax.random.fold_in(key, 11), (64,)),
+    ):
+        eigenvalues = jnp.linalg.eigvalsh(jax.hessian(over_weights)(weights))
+        smallest = float(eigenvalues[0])
+        # Weyl: lambda_min(A + B) >= lambda_min(A) + lambda_min(B), and the data
+        # term is positive semi-definite while the prior's is mu / w. So the
+        # bound is mu / max(w) -- a bound, not an equality: the data term need
+        # not vanish along the eigenvector that attains it. Measured 6.92e-04
+        # against a bound of 6.72e-04 at the truth, 4.37e-04 against 4.36e-04 at
+        # a random point.
+        #
+        # The slack on the bound is the eigensolver's, and its size is derivable
+        # rather than guessed: `eigvalsh` resolves an eigenvalue to about
+        # `eps * lambda_max`, which here is 2.2e-16 * 2.57e+04 = 5.7e-12, i.e.
+        # 5.7e-09 relative to a smallest eigenvalue of 1e-03. At the uniform
+        # point, where the bound is attained exactly, the computed value sits
+        # 6e-09 below it -- so the tolerance is 1e-07 relative, two decades
+        # above eps * cond and still four decades tighter than the effect
+        # being tested.
+        assert smallest > 0.0, f"smallest eigenvalue {smallest:.3e}"
+        assert smallest >= MU / float(jnp.max(weights)) * (1.0 - 1.0e-7)
+
+    def newton(weights, steps=60):
+        for _ in range(steps):
+            gradient = jax.grad(over_weights)(weights)
+            hessian = jax.hessian(over_weights)(weights)
+            # Newton in u = log w, so the iterate cannot leave w > 0.
+            gradient_u = gradient * weights
+            hessian_u = hessian * weights[:, None] * weights[None, :] + jnp.diag(
+                gradient_u
+            )
+            step = jnp.clip(jnp.linalg.solve(hessian_u, -gradient_u), -1.0, 1.0)
+            weights = jnp.exp(jnp.log(weights) + step)
+        return weights
+
+    solutions = [
+        newton(w0)
+        for w0 in (
+            jnp.ones(64),
+            0.5 * truth,
+            2.0 * truth,
+            0.3 + 2.0 * jax.random.uniform(jax.random.fold_in(key, 13), (64,)),
+        )
+    ]
+    reference = solutions[0]
+    for other in solutions[1:]:
+        relative = float(
+            jnp.linalg.norm(other - reference) / jnp.linalg.norm(reference)
+        )
+        assert relative < 1.0e-12, f"Newton solutions differ by {relative:.3e}"
+    assert float(jnp.linalg.norm(jax.grad(over_weights)(reference))) < 1.0e-8
+
+    # And a quasi-Newton fit through the public API reaches it too.
+    fit = MadeToMeasure(optimizer=optax.lbfgs(), num_steps=500).minimize(
+        objective, start
+    )
+    relative = float(
+        jnp.linalg.norm(fit.params["weights"] - reference) / jnp.linalg.norm(reference)
+    )
+    assert relative < 1.0e-3, f"lbfgs is {relative:.3e} from the unique minimum"
+
 
 # --- item 4: the classic iteration against the differentiable one -------------------
 
@@ -399,91 +514,101 @@ def test_tracer_recovery_from_uniform_weights(key) -> None:
 def test_classic_and_differentiable_agree_on_the_tracer_problem(key) -> None:
     """Item 4: both iterations, same objective, same rollout, measured agreement.
 
-    Adam (learning rate 0.02, 10000 steps) reaches ``|dF/dw| = 7.1e-4``; the
-    classic force of change (``epsilon = 3e-5``, 30000 steps) reaches
-    **4.1e-6**. Their objectives then agree to **8.6e-05** absolute, on an
-    objective whose value is -6.33e-2 and whose starting value was 4.41e+03.
-    Their weight vectors are **0.173** apart in relative L2.
+    Re-measured weights-only, and the answer is much better than the first
+    reading of it. The classic force of change (``epsilon = 3e-5``, 30000 steps)
+    reaches the unique minimum to **3.3e-08** relative -- the best of any method
+    tried, because its ``diag(w)`` preconditioner happens to suit this bowl's
+    geometry. Against it:
 
-    The second number is not a defect and is why the comparison is worth
-    running. The stationary *set* of this objective is 55-dimensional (see the
-    recovery test), so two descents in two different metrics stop at two
-    different points of the same flat valley and no step count closes the gap.
-    The objectives agree because a shared stationary set constrains them; the
-    weights do not because nothing constrains them to. The two end points are
-    also differently far from the truth -- 0.284 for Adam against 0.217 for the
-    classic iteration -- and neither is the better answer: both are points the
-    data cannot distinguish.
+    ==============================  =====================  =============
+    rule                            distance to minimum    weight error
+    ==============================  =====================  =============
+    classic FOC, ``eps = 3e-5``     **3.3e-08**            0.2169
+    ``lbfgs()`` x200                6.1e-04                0.2170
+    ``adam(0.1)`` x10000            1.9e-02                0.2196
+    ==============================  =====================  =============
 
-    The sharp version of this comparison, two end points agreeing to 4.8e-11
-    relative, is in ``tests/unit/test_m2m.py`` on a problem with more
-    observables than weights. Read together they say that the classic and
-    differentiable variants implement the same method, and that a
-    made-to-measure fit's weights are only as identifiable as its observables
-    make them.
+    Adam and the classic iteration differ by 1.9e-02 in the weights and
+    1.1e-05 in the objective; LBFGS and the classic iteration by 6.1e-04. The
+    residual disagreement is Adam not converging along the low-curvature
+    directions, **not** two methods choosing different points -- there is only
+    one point (see
+    ``test_the_tracer_objective_has_one_minimum_and_everything_agrees_on_it``).
+
+    The earlier version of this test reported a 0.173 weight gap and explained
+    it as "the size of the flat valley". That explanation was wrong on both
+    counts: the fit was over-parameterised, and the objective has a unique
+    minimum. What survives is the weaker and true claim -- the two iterations
+    implement the same method and agree to the accuracy each is run to.
     """
     problem, truth, start = _tracer_problem(key, n=64, num_steps=24)
     objective = problem.negative_log_posterior
-    gradient = jax.jit(jax.grad(objective))
-    differentiable = made_to_measure(learning_rate=0.02, num_steps=10000).minimize(
-        objective, start
-    )
     classic = MadeToMeasure(num_steps=30000, epsilon=3.0e-5).force_of_change(
         objective, start
     )
-    for label, result, bound in (
-        ("differentiable", differentiable, 1.0e-2),
-        ("classic", classic, 1.0e-4),
+    quasi_newton = MadeToMeasure(optimizer=optax.lbfgs(), num_steps=200).minimize(
+        objective, start
+    )
+    adam = made_to_measure(0.1, 10000).minimize(objective, start)
+
+    for label, result in (
+        ("classic", classic),
+        ("lbfgs", quasi_newton),
+        ("adam", adam),
     ):
-        weights = result.params["weights"]
-        assert jnp.all(jnp.isfinite(weights)), label
-        assert jnp.all(weights > 0.0), label
-        norm = float(jnp.linalg.norm(gradient(result.params)["weights"]))
-        assert norm < bound, f"{label} stopped at |dF/dw| = {norm:.3e}"
-
-    objective_gap = float(
-        abs(differentiable.objective_trace[-1] - classic.objective_trace[-1])
-    )
-    assert objective_gap < 1.0e-3, f"objectives differ by {objective_gap:.3e}"
-
-    # And the disagreement the flat valley leaves, reported rather than hidden.
-    weight_gap = float(
-        jnp.linalg.norm(differentiable.params["weights"] - classic.params["weights"])
-        / jnp.linalg.norm(classic.params["weights"])
-    )
-    assert 0.05 < weight_gap < 0.3, f"weights differ by {weight_gap:.3e}"
-    for result in (differentiable, classic):
+        assert jnp.all(jnp.isfinite(result.params["weights"])), label
+        assert jnp.all(result.params["weights"] > 0.0), label
         error = float(
             jnp.linalg.norm(result.params["weights"] - truth) / jnp.linalg.norm(truth)
         )
-        assert 0.15 < error < 0.5, f"weight error {error:.3e}"
+        assert 0.2 < error < 0.24, f"{label} weight error {error:.4f}"
+
+    reference = classic.params["weights"]
+    for label, result, bound in (
+        ("lbfgs", quasi_newton, 5.0e-3),
+        ("adam", adam, 5.0e-2),
+    ):
+        gap = float(
+            jnp.linalg.norm(result.params["weights"] - reference)
+            / jnp.linalg.norm(reference)
+        )
+        assert gap < bound, f"{label} is {gap:.3e} from the classic iteration"
+
+    objective_gap = float(
+        abs(quasi_newton.objective_trace[-1] - classic.objective_trace[-1])
+    )
+    assert objective_gap < 1.0e-5, f"objectives differ by {objective_gap:.3e}"
 
 
-def test_a_too_large_adam_step_diverges_on_the_tracer_problem(key) -> None:
-    """The differentiable variant is not step-size-free either, and it says so.
+def test_adam_does_not_settle_on_this_objective(key) -> None:
+    """Adam orbits the minimum instead of settling, and the trace is how you see it.
 
-    At a learning rate of 0.05 this fit reaches chi-squared 3.2e-9 after 3000
-    steps and then **leaves**: at 20000 steps the objective is back up at
-    2.24e+02 and chi-squared at 4.27e+01. The objective's curvature spans seven
-    orders of magnitude here (Fisher condition number 2.6e+07), and once Adam's
-    normalized steps are inside the flat valley they wander out of the basin
-    they found. So the classic iteration's hand-tuned ``epsilon`` is not the
-    only step size a made-to-measure fit has to think about -- which is worth
-    stating plainly, because it is the obvious argument *for* the differentiable
-    variant and it does not hold unconditionally. Read ``objective_trace``; it
-    is returned for this.
+    Not divergence -- the earlier reading of this, taken from the
+    over-parameterised fit, called it that. Measured weights-only at learning
+    rate 0.1: the objective is ``+5.25e+01`` after 3000 steps and
+    ``-6.328e-02`` after 20000; at 0.02 it is ``-6.3270e-02`` after 3000 and
+    slightly *worse*, ``-6.3236e-02``, after 20000. Every Adam rate from 0.01 to
+    0.5 ends between 1.9e-02 and 2.8e-02 from the unique minimum whatever the
+    schedule, while LBFGS reaches 6.1e-05.
+
+    The cause is the bowl's condition number, 2.6e+07: Adam's per-coordinate
+    normalization keeps taking steps of order the learning rate along directions
+    whose curvature is ``mu``, so it cannot come to rest there. That is a
+    property of the objective, and the reason the module does not hard-code a
+    rule. Read ``fit.objective_trace``, which is returned for exactly this.
     """
     problem, _, start = _tracer_problem(key, n=64, num_steps=24)
     objective = problem.negative_log_posterior
-    early = made_to_measure(learning_rate=0.05, num_steps=3000).minimize(
-        objective, start
-    )
-    late = made_to_measure(learning_rate=0.05, num_steps=20000).minimize(
-        objective, start
-    )
-    assert -2.0 * float(problem.log_likelihood(early.params)) < 1.0e-6
-    assert -2.0 * float(problem.log_likelihood(late.params)) > 1.0
-    assert float(late.objective_trace[-1]) > float(early.objective_trace[-1])
+    short = made_to_measure(0.1, 3000).minimize(objective, start)
+    long = made_to_measure(0.1, 20000).minimize(objective, start)
+    # More steps is better here, but non-monotonically: the short run is above
+    # zero while the long one has come back down.
+    assert float(short.objective_trace[-1]) > 1.0
+    assert float(long.objective_trace[-1]) < 0.0
+    # And at a smaller rate more steps is *worse*, which is the point.
+    fewer = made_to_measure(0.02, 3000).minimize(objective, start)
+    more = made_to_measure(0.02, 20000).minimize(objective, start)
+    assert float(more.objective_trace[-1]) > float(fewer.objective_trace[-1])
 
 
 # --- item 5: the self-consistent case ----------------------------------------------
@@ -493,32 +618,43 @@ def test_a_too_large_adam_step_diverges_on_the_tracer_problem(key) -> None:
 def test_self_consistent_recovery_from_a_perturbation(key, k_max: int) -> None:
     """Item 5: 32 mutually attracting bodies, weights recovered from a perturbation.
 
-    The weights *are* the masses, so every gradient step moves the orbits and
-    the gradient runs through every force evaluation. From a 10 % random
-    perturbation of the true weights, 400 Adam steps at a learning rate of 0.01
-    give, measured:
+        The weights *are* the masses, so every gradient step moves the orbits and
+        the gradient runs through every force evaluation. From a 10 % random
+        perturbation of the true weights, 400 Adam steps at a learning rate of 0.01
+        give, measured:
 
-    ==========  ==================  =========================
-    ``k_max``   chi-squared         weight error (relative L2)
-    ==========  ==================  =========================
-    0           7.82e+04 -> 1.13e-01  0.0877 -> 0.0854
-    1           8.03e+04 -> 1.18e-01  0.0877 -> 0.0854
-    ==========  ==================  =========================
+        ==========  ==================  =========================
+        ``k_max``   chi-squared         weight error (relative L2)
+        ==========  ==================  =========================
+        0           7.82e+04 -> 1.13e-01  0.0877 -> 0.0854
+        1           8.03e+04 -> 1.18e-01  0.0877 -> 0.0854
+        ==========  ==================  =========================
 
-    Nearly six orders of magnitude off chi-squared and **2.6 % off the weight
-    error**. As in the tracer case that gap is the problem's, not the method's,
-    and here it can be attributed exactly: with 32 weights against 10
-    observables, only **four** Fisher directions rise above ``1e-3`` of the
-    largest (condition number 6.1e+09), the random perturbation puts 47.3 % of
-    its norm in that four-dimensional subspace, and removing all of it would
-    leave 0.0773 -- so 0.0854 after 400 steps is a partly converged fit of the
-    identifiable part and nothing more. Longer runs bear that out: 2000 steps at
-    a learning rate of 0.005 take chi-squared to 7.9e-10 and leave the weight
-    error at 0.0858.
+    Re-measured weights-only after the over-parameterisation fix, and with a
+        quasi-Newton rule for comparison:
 
-    What is asserted below is the direction and the finiteness. The absolute
-    residual a self-consistent fit reaches at N = 32 is an experiment's result,
-    and the experiment is Jaccpot-Dynamics I's.
+        ==========  ====================  ==================  =============
+        rule        ``chi²``              weight error
+        ==========  ====================  ==================  =============
+        ``adam(0.01)`` x400   8.03e+04 -> 3.33e+00   0.0877 -> 0.0749
+        ``adam(0.01)`` x2000  8.03e+04 -> 2.30e-02   0.0877 -> 0.0759
+        ``lbfgs()`` x300      8.03e+04 -> **5.11e-06**  0.0877 -> **0.0688**
+        ==========  ====================  ==================  =============
+
+        So the fit does reduce the weight error, by 22 % of it with LBFGS, and it
+        stalls there. With 32 weights against 10 observables only **four** Fisher
+        directions rise above ``1e-3`` of the largest (condition number 6.1e+09),
+        the random perturbation puts 47.3 % of its norm in that four-dimensional
+        subspace, and removing all of it would leave 0.0773 -- which LBFGS beats,
+        because the entropy prior is centred on the truth here and supplies real
+        information along the rest. On this problem the classic force of change
+        diverges at every ``epsilon`` tried and a fixed-step SGD goes non-finite:
+        the objective is far stiffer than the tracer one (start ``|dF/dw| =
+        5.1e+05``).
+
+        What is asserted below is the direction and the finiteness. The absolute
+        residual a self-consistent fit reaches at N = 32 is an experiment's result,
+        and the experiment is Jaccpot-Dynamics I's.
     """
     k_system, k_weights, k_perturb = jax.random.split(key, 3)
     n = 32
@@ -554,9 +690,12 @@ def test_self_consistent_recovery_from_a_perturbation(key, k_max: int) -> None:
     start = {**truth_params, "weights": perturbed}
 
     initial_chi2 = -2.0 * float(problem.log_likelihood(start))
-    fit = made_to_measure(learning_rate=0.01, num_steps=400).minimize(
+    fit = MadeToMeasure(optimizer=optax.lbfgs(), num_steps=300).minimize(
         problem.negative_log_posterior, start
     )
+    # Weights only: the initial conditions are inputs, not parameters.
+    for leaf in ("positions", "velocities"):
+        assert jnp.array_equal(fit.params[leaf], start[leaf]), leaf
     final_chi2 = -2.0 * float(problem.log_likelihood(fit.params))
     assert jnp.all(jnp.isfinite(fit.params["weights"]))
     assert jnp.all(fit.params["weights"] > 0.0)
@@ -1055,90 +1194,88 @@ def test_the_production_gradient_tracks_the_schedule_it_realised(
 # --- which optimizer, measured on the real problem --------------------------------
 
 
-def test_no_optimizer_wins_on_both_constructions(key) -> None:
+def test_a_well_conditioned_rule_is_what_reaches_the_minimum(key) -> None:
     """The measured answer to "which rule should a made-to-measure fit use".
 
-    There is no default worth hard-coding, and this test is the evidence.
-    Measured on the 64-weight tracer problem, 10000 steps unless stated
-    (``|dF/dw|`` at the end point; the start is 1.32e+04):
+    The objective's Fisher condition number is **2.6e+07** on the tracer problem
+    and **6.1e+09** on the self-consistent one, so this is a question about
+    conditioning, not about step sizes. Measured, weights only, distance to the
+    unique minimum in relative L2:
 
-    ==============================  =========  ========  ======
-    rule                            ``|g|``    ``chi2``  weight error
-    ==============================  =========  ========  ======
-    ``adam(0.02)``                  7.1e-04    5.4e-11   0.284
-    ``adam(0.1)``                   1.0e-02    1.2e-08   **2.409**
-    ``adam(exponential_decay)``     2.7e-04    3.8e-11   0.254
-    ``adam(0.05, eps=1e-4)``        4.0e-03    8.5e-10   0.720
-    ``sgd(1e-6)``                   **5.6e-05**  6.5e-11   0.246
-    ``lbfgs()``, **50** steps       6.8e-04    8.5e-10   0.246
-    ==============================  =========  ========  ======
+    ================================  ==============  =============
+    rule                              tracer          weight error
+    ================================  ==============  =============
+    classic FOC, ``eps = 3e-5``       **3.3e-08**     0.2169
+    ``lbfgs()`` x500                  6.1e-05         0.2169
+    ``lbfgs()`` x200                  6.1e-04         0.2170
+    ``sgd(1e-5)``                     1.2e-02         0.2182
+    ``adam``, every rate 0.01 … 0.5   1.9e-02 … 2.8e-02  0.2195 … 0.2206
+    ``adam`` + cosine / exp decay     1.9e-02         0.2193 … 0.2195
+    ================================  ==============  =============
 
-    Three things in that table are worth keeping. **Adam is fragile here**: at
-    ``lr = 0.1`` it drives chi-squared to 1.2e-08 and lands 241 % away from the
-    weights that made the data, and ``lr = 0.2`` is worse still. **Plain SGD
-    wins on gradient norm** by an order of magnitude, because the tracer
-    objective is quadratic in the weights and Adam's per-coordinate
-    normalization fights a curvature spread of 2.6e+07 that plain descent simply
-    follows. **LBFGS reaches a lower objective in fifty steps than Adam does in
-    ten thousand.** Tuning Adam's ``eps`` up to 1e-4 rescues ``lr = 0.05`` from
-    divergence, which is the standard stiff-problem fix and worth knowing.
+    And on the self-consistent problem (N = 32, ``k_max = 1``, start
+    ``|dF/dw| = 5.1e+05``), where the orbits move with the weights:
 
-    None of it transfers. On the self-consistent problem (N = 32, ``k_max = 1``,
-    start ``|g| = 5.1e+05``) ``sgd(1e-6)`` **diverges to non-finite weights**,
-    ``adam(0.005)`` reaches ``|g| = 5.6e-04``, and ``lbfgs`` x100 reaches the
-    lowest weight error (0.0779 against Adam's 0.0859) at a much worse gradient
-    norm (0.63). So the rule that is best on one construction fails on the
-    other, which is why :class:`~mimirax.inference.MadeToMeasure` requires an
-    ``optimizer`` rather than choosing one.
+    ================================  ==========  ==========  =============
+    rule                              ``|g|``     ``chi2``    weight error
+    ================================  ==========  ==========  =============
+    ``lbfgs()`` x300                  **6.6e-02** **5.1e-06** **0.0688**
+    ``adam(0.01)`` x2000              1.4e+00     2.3e-02     0.0759
+    ``sgd(1e-6)``                     non-finite  —           —
+    classic FOC, any ``eps`` tried    diverges    —           —
+    ================================  ==========  ==========  =============
 
-    And the sharpest point, which is about the problem and not the optimizer:
-    every row above reaches a chi-squared far below the noise, and the weight
-    errors span **0.246 to 2.409**. On a degenerate problem the optimizer
-    decides *where in the flat valley you stop*, and the residual cannot tell
-    you which point you got. Reading a made-to-measure fit off chi-squared alone
-    is therefore not safe, whatever the optimizer.
+    Three things worth keeping. **Adam plateaus**: every rate and every schedule
+    tried lands 1.9e-02 to 2.8e-02 from the minimum, because its per-coordinate
+    normalization keeps taking steps of order the learning rate along directions
+    whose curvature is ``mu``. **The classic reweighting is the best rule on the
+    tracer problem** -- Syer & Tremaine's ``diag(w)`` preconditioner suits that
+    bowl, which is a nice thing for a 1996 algorithm to be right about -- and it
+    **diverges** on the self-consistent one, where it is also the wrong
+    gradient. **LBFGS is the only rule that works well on both**, and it is
+    therefore the one to reach for; it is also the reason `minimize` had to learn
+    to pass a line search its ``value``/``grad``/``value_fn``.
 
-    Asserted here: the two rules that behave well on this problem reach a
-    materially lower objective than the Adam default, and the badly scaled Adam
-    run lands far from the truth while still fitting the data. Both are claims
-    about the problem, so both are cheap to keep true.
+    So the answer to "should we use a more involved scheme, given the eigenvalue
+    spread" is yes, and it is not a speed-up: at this conditioning a first-order
+    rule does not reach the answer at all, and the answer is well defined
+    (the objective is strictly convex) so failing to reach it is purely the
+    optimizer's fault.
     """
     problem, truth, start = _tracer_problem(key, n=64, num_steps=24)
     objective = problem.negative_log_posterior
 
-    def error(result):
-        return float(
-            jnp.linalg.norm(result.params["weights"] - truth) / jnp.linalg.norm(truth)
-        )
-
-    adam_default = made_to_measure(0.02, 3000).minimize(objective, start)
-    lbfgs = MadeToMeasure(optimizer=optax.lbfgs(), num_steps=50).minimize(
+    quasi_newton = MadeToMeasure(optimizer=optax.lbfgs(), num_steps=500).minimize(
         objective, start
     )
-    plain = MadeToMeasure(optimizer=optax.sgd(1.0e-6), num_steps=3000).minimize(
+    classic = MadeToMeasure(num_steps=30000, epsilon=3.0e-5).force_of_change(
         objective, start
     )
-    badly_scaled = made_to_measure(0.1, 3000).minimize(objective, start)
+    adam = made_to_measure(0.1, 10000).minimize(objective, start)
+    scheduled = made_to_measure(
+        optax.exponential_decay(0.1, 2000, 0.3), 10000
+    ).minimize(objective, start)
 
     for label, result in (
-        ("lbfgs", lbfgs),
-        ("sgd", plain),
-        ("adam", adam_default),
-        ("adam(0.1)", badly_scaled),
+        ("lbfgs", quasi_newton),
+        ("classic", classic),
+        ("adam", adam),
+        ("adam+schedule", scheduled),
     ):
         assert jnp.all(jnp.isfinite(result.params["weights"])), label
         assert jnp.all(result.params["weights"] > 0.0), label
 
-    # LBFGS in 50 steps beats Adam in 3000 on the objective it is minimizing.
-    assert float(lbfgs.objective_trace[-1]) < float(adam_default.objective_trace[-1])
-    assert float(plain.objective_trace[-1]) < float(adam_default.objective_trace[-1])
+    reference = classic.params["weights"]
 
-    # And the optimizer decides where in the valley the fit stops.
-    assert error(badly_scaled) > 4.0 * error(
-        lbfgs
-    ), f"badly scaled Adam {error(badly_scaled):.3f} vs lbfgs {error(lbfgs):.3f}"
-    # chi-squared 1.5e-06 at 3000 steps, from a start of 8.82e+03: nine orders
-    # down, and still 241 % wrong about the weights. That is the whole point.
-    assert (
-        -2.0 * float(problem.log_likelihood(badly_scaled.params)) < 1.0e-4
-    ), "the badly scaled run must still fit the data -- that is the whole point"
+    def distance(result):
+        return float(
+            jnp.linalg.norm(result.params["weights"] - reference)
+            / jnp.linalg.norm(reference)
+        )
+
+    # The well-conditioned rules reach the minimum; Adam plateaus an order of
+    # magnitude short of them, and a schedule does not rescue it.
+    assert distance(quasi_newton) < 1.0e-3, f"lbfgs {distance(quasi_newton):.3e}"
+    assert distance(adam) > 10.0 * distance(quasi_newton)
+    assert distance(scheduled) > 10.0 * distance(quasi_newton)
+    assert 1.0e-2 < distance(adam) < 5.0e-2

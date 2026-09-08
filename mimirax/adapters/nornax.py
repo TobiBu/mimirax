@@ -348,8 +348,15 @@ class NornaxRollout:
         The case the differentiable N-body stack was built for. Because the
         weights are the masses, the orbits themselves depend on the weights, so
         ``d(objective)/d(weights)`` flows through the force evaluations and
-        through every step of the integration -- which is the part no classic
-        made-to-measure code computes. ``force`` must be a real nornax
+        through every step of the integration.
+
+        That orbit-response term is not unprecedented -- Bovy, Kawata & Hunt
+        (2018, arXiv:1704.03884) compute it for *external-potential* parameters
+        by finite differencing the orbit integration, one extra integration per
+        parameter -- but they explicitly exclude self-gravity, and finite
+        differencing costs ``n + 1`` rollouts when the parameters are the ``n``
+        particle masses. Reverse mode costs one, whatever ``n`` is, which is what
+        makes this construction tractable rather than merely expressible. ``force`` must be a real nornax
         ``MutualForceModel``; a mimirax ``ForceModel`` is rejected above
         ``k_max = 0``.
 

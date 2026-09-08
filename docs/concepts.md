@@ -70,7 +70,12 @@ particles in a potential the weights do not set, which is classic made-to-measur
 *self-consistent* construction (`NornaxRollout.self_consistent`) the weights **are** the masses,
 so the orbits themselves depend on what is being fitted — and the gradient of the objective runs
 through every force evaluation of the integration. That second case is what the differentiable
-N-body stack was built for and what no classic made-to-measure code computes.
+N-body stack was built for. The term it adds is **68 %** of the gradient's norm after a fraction
+of a dynamical time, measured; the classic force-of-change bracket cannot contain it, because it
+assumes the orbits are fixed. Prior work computes the analogous term for a handful of
+*external-potential* parameters by finite differencing the orbit integration (Bovy, Kawata & Hunt
+2018), which costs one integration per parameter and is entirely practical for one or two; it is
+not, when the parameters are the *N* particle masses.
 
 **Two iterations, one stationary point.** `MadeToMeasure.minimize` is the differentiable variant:
 any `optax` rule descending in `ln w`, differentiated through the rollout. `MadeToMeasure.

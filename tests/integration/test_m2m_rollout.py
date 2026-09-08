@@ -291,6 +291,17 @@ def test_the_self_consistent_gradient_actually_flows_through_the_dynamics(key) -
     finite-difference check that merely passes is not enough: the FD test above
     would pass just as happily if the weights never reached the forces at all.
     This is the test that says they do.
+
+    **Prior art, so the claim is stated at the right strength.** The
+    orbit-response term is not new. Bovy, Kawata & Hunt (2018,
+    arXiv:1704.03884) compute the analogous derivative for *external-potential*
+    parameters by finite differencing the orbit integration -- one extra
+    integration per parameter -- and it is entirely practical for the one or two
+    parameters they fit. They also state that they ignore self-gravity, so the
+    regime measured here is outside their method by construction. What reverse
+    mode changes is the cost: ``O(1)`` in the parameter count instead of
+    ``O(n)``, which is the difference between one rollout and 25 of them here,
+    and between one and a million for a galaxy.
     """
     k_system, k_weights = jax.random.split(key)
     n = 24

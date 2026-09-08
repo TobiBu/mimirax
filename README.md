@@ -202,8 +202,10 @@ Measured numbers for every problem in the suite are in the tests' docstrings and
 
 `NornaxRollout.self_consistent` is the other construction: the weights **are** the masses, so
 the orbits depend on what is being fitted and the gradient runs through every force evaluation of
-the integration — the part no classic made-to-measure code computes. Pass a real `nornax`
-`MutualForceModel` (its direct sum, or jaccpot's `BlockStepFMM`) for that, and any `k_max`.
+the integration. That orbit-response term is **68 %** of the gradient's norm after a fraction of a
+dynamical time (measured), and the classic force-of-change bracket cannot contain it because it
+assumes fixed orbits. Pass a real `nornax` `MutualForceModel` (its direct sum, or jaccpot's
+`BlockStepFMM`) for that, and any `k_max`.
 
 `MadeToMeasure.force_of_change` runs the classic Syer & Tremaine update on the same objective,
 as the oracle the differentiable variant is compared against. Both are stationary where

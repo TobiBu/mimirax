@@ -253,8 +253,37 @@ class NornaxRollout:
         frozen for the whole rollout. Freeze them to make the map globally
         smooth in the continuous state, which is what a finite-difference
         gradient check needs.
+
+        **This is not a free choice, and the difference is measured.** With it
+        on, the rollout integrates a schedule that depends on the weights
+        through the acceleration, and nornax severs that dependence with
+        ``stop_gradient``. The gradient is therefore exact for the schedule the
+        forward pass *realised* -- reverse and forward mode agree on it to
+        2.6e-16 -- but the objective is only piecewise smooth in the weights: a
+        weight change large enough to move a particle across a rung boundary
+        lands on a different map, with a kink between. On a 16-body,
+        three-rung test system the production gradient differs from the
+        frozen-schedule one by 65 % in norm (cosine 0.953), because the two
+        realise different schedules. Neither is wrong; they are gradients of
+        different maps. Freeze the schedule when a fit must descend one smooth
+        objective, and expect the kinks when it must not.
     checkpoint : bool
-        Whether to wrap each base step in ``jax.checkpoint``.
+        Whether to wrap each base step in ``jax.checkpoint``, bounding the
+        retained backward-pass state to the base-step boundaries. Leave it on:
+        it does not change the gradient (measured bit-identical, single- and
+        multi-rung) and it is what keeps a long rollout's memory linear in
+        ``num_steps``.
+    checkpoint_substeps : bool
+        Whether to additionally remat each sub-step boundary's kick.
+        :attr:`checkpoint` bounds memory *across* base steps but still
+        materializes all ``2**k_max`` sub-step pair tensors while
+        differentiating one base step; this bounds that to one boundary's
+        worth. nornax's rollout documents it as needed for deep ``k_max``
+        gradients, which otherwise run out of memory -- so it is the knob a
+        made-to-measure fit at FMM scale and large ``k_max`` will need, and it
+        is exposed here rather than left reachable only by bypassing the
+        adapter. Off by default, as in nornax; it changes the memory schedule,
+        not the result.
     record : Callable[[Any], PyTree] | None
         nornax's ``record_fn``, which must return a *mapping* so that
         :meth:`__call__` can add the ``"weights"`` leaf beside it; ``None``
@@ -285,6 +314,7 @@ class NornaxRollout:
     eps: float = 1.0
     reassign_rungs: bool = True
     checkpoint: bool = True
+    checkpoint_substeps: bool = False
     record: Callable[[Any], PyTree] | None = None
     rebuild_fn: Callable[..., Any] | None = None
     rebuild_every: int = 1
@@ -477,6 +507,7 @@ class NornaxRollout:
             eta=self.eta,
             eps=self.eps,
             checkpoint=self.checkpoint,
+            checkpoint_substeps=self.checkpoint_substeps,
             reassign_rungs=self.reassign_rungs,
             rebuild_fn=self.rebuild_fn,
             rebuild_every=self.rebuild_every,

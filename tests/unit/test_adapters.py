@@ -9,9 +9,13 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from mimirax import ForceModel, ForwardModel
+from mimirax import ForceModel, ForwardModel, TimeAverage, WeightedKernelSum
 from mimirax.adapters.jaccpot import JaccpotForceModel
-from mimirax.adapters.nornax import NornaxRollout, SingleRungMutualForce
+from mimirax.adapters.nornax import (
+    FoldedRollout,
+    NornaxRollout,
+    SingleRungMutualForce,
+)
 from mimirax.adapters.odisseo import OdisseoForwardModel
 from mimirax.testing import DirectSumGravity
 
@@ -161,3 +165,76 @@ def test_the_bridge_is_transparent_to_gradients() -> None:
         )
 
     assert jnp.allclose(jax.grad(direct)(masses), jax.grad(bridged)(masses), atol=1e-14)
+
+
+def test_folded_rollout_refuses_an_uneven_split() -> None:
+    """An uneven segment split is refused, not silently rounded.
+
+    Under a decaying average the segments are not interchangeable, so a split
+    that left a short final segment would weight the trajectory wrongly. The
+    error names both numbers.
+    """
+    observable = TimeAverage(WeightedKernelSum(lambda state: jnp.ones((2, 1))))
+    rollout = NornaxRollout.tracer(DirectSumGravity(), dt=0.01, num_steps=24)
+    with pytest.raises(ValueError, match="does not divide"):
+        FoldedRollout(rollout=rollout, observable=observable, segments=5)
+    with pytest.raises(ValueError, match="segments must be >= 1"):
+        FoldedRollout(rollout=rollout, observable=observable, segments=0)
+    # And the divisors are accepted.
+    for segments in (1, 2, 3, 4, 6, 8, 12, 24):
+        assert (
+            FoldedRollout(
+                rollout=rollout, observable=observable, segments=segments
+            ).segments
+            == segments
+        )
+
+
+def test_balanced_picks_the_best_available_divisor() -> None:
+    """`balanced` minimises `num_steps / segments + segments` over the divisors.
+
+    The continuous optimum is `sqrt(num_steps)`; the split has to be even, so it
+    takes the largest divisor at or below that. For 24 that is 4 (not 4.9), for
+    1024 it is 32 exactly, and for a prime step count there is nothing to do.
+    """
+    observable = TimeAverage(WeightedKernelSum(lambda state: jnp.ones((2, 1))))
+
+    def balanced_for(steps):
+        rollout = NornaxRollout.tracer(DirectSumGravity(), dt=0.01, num_steps=steps)
+        return FoldedRollout.balanced(rollout, observable).segments
+
+    assert balanced_for(24) == 4
+    assert balanced_for(1024) == 32
+    assert balanced_for(256) == 16
+    assert balanced_for(100) == 10
+    assert balanced_for(23) == 1  # prime: no even split beats one segment
+    assert balanced_for(1) == 1
+
+
+def test_folding_returns_a_forward_model_and_needs_nornax_to_run() -> None:
+    """`folding` builds a ForwardModel; running it without nornax names the extra."""
+    observable = TimeAverage(WeightedKernelSum(lambda state: jnp.ones((2, 1))))
+    folded = NornaxRollout.tracer(DirectSumGravity(), dt=0.01, num_steps=8).folding(
+        observable, segments=2
+    )
+    assert isinstance(folded, FoldedRollout)
+    assert isinstance(folded, ForwardModel)
+    real_import = builtins.__import__
+
+    def _no_nornax(name, *args, **kwargs):
+        if name.startswith("nornax"):
+            raise ImportError("no module named nornax")
+        return real_import(name, *args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as patch:
+        for module in [key for key in sys.modules if key.startswith("nornax")]:
+            patch.delitem(sys.modules, module, raising=False)
+        patch.setattr(builtins, "__import__", _no_nornax)
+        with pytest.raises(ImportError, match=r"mimirax\[nornax\]"):
+            folded(
+                {
+                    "positions": jnp.zeros((2, 3)),
+                    "velocities": jnp.zeros((2, 3)),
+                    "weights": jnp.ones(2),
+                }
+            )

@@ -32,6 +32,7 @@ from mimirax import (
     EntropyPrior,
     GaussianLikelihood,
     GaussianRadialBins,
+    IdentityObservable,
     InferenceProblem,
     MadeToMeasure,
     TimeAverage,
@@ -41,7 +42,11 @@ from mimirax import (
     fisher_information,
     made_to_measure,
 )
-from mimirax.adapters.nornax import NornaxRollout, SingleRungMutualForce
+from mimirax.adapters.nornax import (
+    FoldedRollout,
+    NornaxRollout,
+    SingleRungMutualForce,
+)
 from mimirax.testing import DirectSumGravity, SoftenedPointMassField
 
 nornax = pytest.importorskip("nornax", reason="mimirax[nornax] is not installed")
@@ -1371,3 +1376,140 @@ def test_a_well_conditioned_rule_is_what_reaches_the_minimum(key) -> None:
     assert distance(adam) > 10.0 * distance(quasi_newton)
     assert distance(scheduled) > 10.0 * distance(quasi_newton)
     assert 1.0e-2 < distance(adam) < 5.0e-2
+
+
+# --- folding the observable into the rollout: the memory schedule -----------------
+
+
+@pytest.mark.parametrize("decay_steps", [None, 6.0])
+@pytest.mark.parametrize("segments", [1, 2, 4, 6, 12, 24])
+def test_folding_reproduces_the_stacked_path_exactly(key, decay_steps, segments):
+    """`FoldedRollout` is a memory schedule, so it must not move the answer.
+
+    The whole justification for folding the observable into the rollout and
+    chaining checkpointed segments is that it computes the same number more
+    cheaply. This asserts that, in the value **and** in the gradient, over every
+    divisor of a 24-step rollout and for both averaging modes. Measured: value
+    agreement 1.1e-16 for the mean and 6.0e-16 for the decaying average,
+    gradients 1.0e-16 to 6.0e-16 -- round-off, independent of the segment count.
+
+    The decaying average is the case worth parametrising: the segments are not
+    interchangeable there, so a fold that lost the global step order, or a
+    normalization that used the per-segment count instead of the total, would
+    show up here and nowhere else.
+    """
+    k_system, k_weights = jax.random.split(key)
+    n, steps = 32, 24
+    positions, velocities = _log_spaced(k_system, n)
+    weights = 0.5 + jax.random.uniform(k_weights, (n,))
+    params = {
+        "positions": positions,
+        "velocities": velocities,
+        "weights": weights,
+    }
+    rollout = NornaxRollout.self_consistent(
+        MutualDirectSumGravity(G=1.0, softening=SOFTENING, k_max=0),
+        dt=0.02,
+        num_steps=steps,
+        k_max=0,
+        reassign_rungs=False,
+    )
+    observable = TimeAverage(
+        WeightedKernelSum(
+            GaussianRadialBins(centres=jnp.asarray([0.5, 1.0, 2.0]), width=0.4)
+        ),
+        decay_steps=decay_steps,
+    )
+    folded = rollout.folding(observable, segments=segments)
+
+    stacked = observable(rollout(params))
+    got = folded(params)
+    relative = float(jnp.linalg.norm(got - stacked) / jnp.linalg.norm(stacked))
+    assert relative < 1.0e-14, f"folding moved the value by {relative:.3e}"
+
+    def through_folded(w):
+        return jnp.sum(folded({**params, "weights": w}))
+
+    def through_stacked(w):
+        return jnp.sum(observable(rollout({**params, "weights": w})))
+
+    folded_gradient = jax.grad(through_folded)(weights)
+    stacked_gradient = jax.grad(through_stacked)(weights)
+    relative = float(
+        jnp.linalg.norm(folded_gradient - stacked_gradient)
+        / jnp.linalg.norm(stacked_gradient)
+    )
+    assert relative < 1.0e-13, f"folding moved the gradient by {relative:.3e}"
+
+
+def test_folding_and_segmenting_cut_the_gradient_s_memory(key) -> None:
+    """The point of the exercise, measured with XLA's own accounting.
+
+    Peak scratch for one gradient of the full negative log posterior, from
+    ``memory_analysis().temp_size_in_bytes``:
+
+    =====  ======  ==========  ==============  ====================  =========
+    ``n``  ``t``   stacked     folded, ``S=1`` folded, ``balanced``  reduction
+    =====  ======  ==========  ==============  ====================  =========
+    64     64      1.8 MB      2.0 MB          1.0 MB  (S=8)         1.8x
+    64     256     6.8 MB      5.5 MB          1.2 MB  (S=16)        5.8x
+    64     1024    27.1 MB     19.5 MB         1.5 MB  (S=32)        **17.9x**
+    256    256     28.6 MB     31.4 MB         14.2 MB (S=16)        2.0x
+    256    1024    108.1 MB    87.3 MB         15.6 MB (S=32)        6.9x
+    =====  ======  ==========  ==============  ====================  =========
+
+    Two things to read off. The stacked column is **linear in t** and the
+    balanced column is nearly flat, which is the ``O(sqrt(t))`` law. And folding
+    *alone* (``S = 1``) buys little or nothing -- it removes the stacked
+    trajectory but leaves the scan's per-step carries -- so the segmenting is
+    where the win is, and folding is what makes segmenting possible.
+
+    The reduction is smaller at ``n = 256`` (6.9x against 17.9x) and that is
+    honest rather than disappointing: segmenting shrinks the ``O(t * n)`` term
+    and leaves the direct sum's ``O(n^2)`` per-step scratch untouched. An FMM
+    changes that term to ``O(n log n)`` but it stays per-step and stays outside
+    what this buys.
+    """
+    n, steps = 64, 256
+    k_system, k_weights = jax.random.split(key)
+    positions, velocities = _log_spaced(k_system, n)
+    params = {
+        "positions": positions,
+        "velocities": velocities,
+        "weights": 0.5 + jax.random.uniform(k_weights, (n,)),
+    }
+    rollout = NornaxRollout.self_consistent(
+        MutualDirectSumGravity(G=1.0, softening=SOFTENING, k_max=0),
+        dt=0.02,
+        num_steps=steps,
+        k_max=0,
+        reassign_rungs=False,
+    )
+    observable = TimeAverage(
+        WeightedKernelSum(
+            GaussianRadialBins(centres=jnp.asarray([0.5, 1.0, 2.0, 3.0]), width=0.4)
+        )
+    )
+
+    def scratch(forward, inner, observed):
+        problem = InferenceProblem(
+            forward=forward,
+            observable=inner,
+            likelihood=GaussianLikelihood(sigma=SIGMA),
+            observed=observed,
+            priors=(EntropyPrior(mu=MU),),
+        )
+        compiled = (
+            jax.jit(jax.grad(problem.negative_log_posterior)).lower(params).compile()
+        )
+        return compiled.memory_analysis().temp_size_in_bytes
+
+    balanced = FoldedRollout.balanced(rollout, observable)
+    assert balanced.segments == 16, balanced.segments
+
+    stacked_bytes = scratch(rollout, observable, observable(rollout(params)) + 0.05)
+    folded_bytes = scratch(balanced, IdentityObservable(), balanced(params) + 0.05)
+    assert folded_bytes < stacked_bytes / 3.0, (
+        f"stacked {stacked_bytes / 1e6:.1f} MB vs folded "
+        f"{folded_bytes / 1e6:.1f} MB"
+    )

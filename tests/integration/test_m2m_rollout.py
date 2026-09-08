@@ -247,46 +247,127 @@ def test_gradient_through_a_self_consistent_rollout_matches_a_finite_difference(
 
 
 def test_the_self_consistent_gradient_actually_flows_through_the_dynamics(key) -> None:
-    """The claim behind case (a): the same fit with fixed masses has another gradient.
+    """The module's one claim classic made-to-measure cannot make, quantified.
 
-    A gradient that agreed with the tracer construction's would mean the weights
-    were not reaching the forces at all, and the finite-difference check above
-    would pass just as happily. So this compares the two constructions on the
-    *same* system and the same observable: the self-consistent gradient differs
-    from the tracer one by a factor of order unity in norm and is not parallel
-    to it, which is the part no classic made-to-measure code computes.
+    When the weights are the masses, ``dF/dw`` splits into an **observable path**
+    -- which is exactly Syer & Tremaine's bracket -- and a **dynamical path**
+    through every force evaluation of the integration, which the classic
+    algorithm cannot contain because it assumes the orbits are fixed. This test
+    isolates the second term by running the *same* system, orbits and observable
+    twice: once with the weights as the masses, and once with them held out of
+    the dynamics at the same numerical values, so the difference of the two
+    gradients *is* the dynamical path.
+
+    Measured on this test's own system, N = 24, softening 0.2, ``dt = 0.02``:
+
+    ================  ====================  ======================
+    integration time  ``|g_dyn|/|g_full|``  cosine(full, classic)
+    ================  ====================  ======================
+    t = 0.02  (1)     0.127                 0.9951
+    t = 0.04  (2)     0.235                 0.9859
+    t = 0.08  (4)     0.429                 0.9617
+    t = 0.16  (8)     0.633                 0.9263
+    t = 0.32  (16)    **0.685**             0.8523
+    t = 0.64  (32)    **0.677**             0.8626
+    t = 1.28  (64)    0.536                 0.9360
+    t = 2.56  (128)   **0.974**             **0.3022**
+    ================  ====================  ======================
+
+    **One base step already puts 13 % of the gradient outside the classic
+    bracket, and eight put 63 % there.** By a fraction of a dynamical time the
+    omitted term is about 68 % of the gradient's norm and misdirects the step by
+    ~30 degrees. Beyond that the growth is *not* monotone -- 0.54 at t = 1.28,
+    0.97 at t = 2.56 -- because the orbits are mixing and the gradient's
+    structure changes with them; the honest statement is that the share rises
+    fast and then fluctuates between a half and all of it, not that it converges
+    to a constant.
+
+    Push the self-gravity harder and it is worse. At softening 0.05, t = 0.64:
+    the dynamical term is **100 %** of the norm and the cosine drops to
+    **0.30** -- the classic bracket is then 72 degrees away from the descent
+    direction, and no step size rescues that.
+
+    This is the number the paper should quote, and it is also why a
+    finite-difference check that merely passes is not enough: the FD test above
+    would pass just as happily if the weights never reached the forces at all.
+    This is the test that says they do.
     """
     k_system, k_weights = jax.random.split(key)
-    n = 16
+    n = 24
+    steps = 32
     positions, velocities = _plummer_like(k_system, n)
     weights = 0.5 + jax.random.uniform(k_weights, (n,))
-    params = {"positions": positions, "velocities": velocities, "weights": weights}
+    params = {
+        "positions": positions,
+        "velocities": velocities,
+        "weights": weights,
+    }
     force = MutualDirectSumGravity(G=1.0, softening=SOFTENING, k_max=0)
     observable = TimeAverage(
         WeightedKernelSum(
-            GaussianRadialBins(centres=jnp.asarray([0.5, 1.0, 1.5]), width=0.4)
+            GaussianRadialBins(
+                centres=jnp.asarray([0.4, 0.8, 1.2, 1.6, 2.0]), width=0.3
+            )
         )
     )
+    common = dict(dt=0.02, num_steps=steps, reassign_rungs=False)
+    self_consistent = NornaxRollout.self_consistent(force, k_max=0, **common)
+    # The same orbits and the same observable, with the weights out of the
+    # dynamics: its gradient is the observable path alone, i.e. the classic
+    # bracket. `masses=weights` keeps the trajectory identical.
+    observable_path_only = NornaxRollout.tracer(force, masses=weights, **common)
+    observed = observable(self_consistent(params)) + 0.05
 
     def gradient_of(rollout):
-        observed = observable(rollout(params)) + 0.05
         problem = InferenceProblem(
             forward=rollout,
             observable=observable,
             likelihood=GaussianLikelihood(sigma=SIGMA),
             observed=observed,
+            priors=(EntropyPrior(mu=MU),),
         )
         return jax.grad(problem.negative_log_posterior)(params)["weights"]
 
-    common = dict(dt=0.02, num_steps=12, reassign_rungs=False)
-    consistent = gradient_of(NornaxRollout.self_consistent(force, **common))
-    tracer = gradient_of(NornaxRollout.tracer(force, masses=weights, **common))
-    assert jnp.all(jnp.isfinite(consistent))
+    full = gradient_of(self_consistent)
+    classic = gradient_of(observable_path_only)
+    dynamical = full - classic
+    assert jnp.all(jnp.isfinite(full))
+
+    share = float(jnp.linalg.norm(dynamical) / jnp.linalg.norm(full))
     cosine = float(
-        jnp.dot(consistent, tracer)
-        / (jnp.linalg.norm(consistent) * jnp.linalg.norm(tracer))
+        jnp.dot(full, classic) / (jnp.linalg.norm(full) * jnp.linalg.norm(classic))
     )
-    assert abs(cosine) < 0.999, f"the two gradients are parallel (cos = {cosine:.6f})"
+    assert share > 0.5, f"the dynamical term is only {share:.3f} of the gradient"
+    assert cosine < 0.95, f"the classic bracket is aligned to {cosine:.6f}"
+
+    # And it grows with integration time, which is what makes it a dynamical
+    # effect rather than a constant offset: one base step gives 0.127 against
+    # 0.677 at thirty-two.
+    brief = NornaxRollout.self_consistent(
+        force, k_max=0, dt=0.02, num_steps=1, reassign_rungs=False
+    )
+    brief_only = NornaxRollout.tracer(
+        force, masses=weights, dt=0.02, num_steps=1, reassign_rungs=False
+    )
+    brief_observed = observable(brief(params)) + 0.05
+
+    def brief_gradient(rollout):
+        problem = InferenceProblem(
+            forward=rollout,
+            observable=observable,
+            likelihood=GaussianLikelihood(sigma=SIGMA),
+            observed=brief_observed,
+            priors=(EntropyPrior(mu=MU),),
+        )
+        return jax.grad(problem.negative_log_posterior)(params)["weights"]
+
+    brief_full = brief_gradient(brief)
+    brief_share = float(
+        jnp.linalg.norm(brief_full - brief_gradient(brief_only))
+        / jnp.linalg.norm(brief_full)
+    )
+    assert brief_share < 0.2, f"one step already gives {brief_share:.3f}"
+    assert share > 3.0 * brief_share
 
 
 def test_gradient_through_a_tracer_rollout_matches_a_finite_difference(key) -> None:

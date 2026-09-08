@@ -33,6 +33,7 @@ from mimirax.types import FitResult, SampleResult
 
 __all__ = [
     "Constraint",
+    "FoldableObservable",
     "ForceModel",
     "ForwardModel",
     "Likelihood",
@@ -135,6 +136,115 @@ class Observable(Protocol):
         -------
         Array
             The predicted data, shaped like the corresponding observation.
+        """
+        ...
+
+
+@runtime_checkable
+class FoldableObservable(Protocol):
+    """An :class:`Observable` that can also be accumulated one snapshot at a time.
+
+    WHY THIS EXISTS. A time-averaged observable is a *reduction* over a
+    trajectory, and the cheap way to evaluate a reduction is to fold it into the
+    integration rather than to stack the trajectory and average afterwards.
+    Stacking costs ``O(t * n)`` memory in the **forward** pass alone -- for a
+    made-to-measure fit over many dynamical times that is the term that decides
+    whether the problem fits on a machine, and it has nothing to do with
+    autodiff. Folding costs ``O(m)``.
+
+    So this is a *capability*, not a replacement. It is a separate protocol
+    because :class:`Observable` is ``runtime_checkable`` and widening it would
+    make ``isinstance`` reject every observable that predates this; and it is
+    *narrower* than :class:`Observable` because not every observable is
+    foldable. A mean folds. Exponential smoothing folds, through the recursion
+    ``state <- a * state + value``. A median does not, and neither does anything
+    needing the whole sample at once.
+
+    An implementation must satisfy the **fold law**: for any trajectory,
+
+        result(fold(... fold(initial(s_0), value(s_0)) ..., value(s_{t-1})), t)
+
+    equals ``self(stacked_trajectory)``, the plain :class:`Observable` call. The
+    two paths are then interchangeable and a caller can choose on memory
+    grounds alone. :class:`mimirax.observables.TimeAverage` satisfies both
+    protocols and a test pins the law to round-off.
+
+    ``value`` is separated from ``fold`` on purpose: a rollout can then evaluate
+    ``value`` inside its own loop -- where the snapshot already is -- and stack
+    only the ``(m,)`` results instead of the ``(n, 3)`` state.
+    """
+
+    def value(self, snapshot: PyTree) -> Array:
+        """Evaluate the observable at one snapshot.
+
+        Parameters
+        ----------
+        snapshot : PyTree
+            A single time slice, with no leading time axis.
+
+        Returns
+        -------
+        Array
+            ``(m,)`` observable values at that snapshot.
+        """
+        ...
+
+    def initial(self, snapshot: PyTree) -> PyTree:
+        """Return the zero accumulator, shaped from a template snapshot.
+
+        Must not depend on the snapshot's *values*, only on its shapes and
+        dtypes, so that it can be built with :func:`jax.eval_shape` and carries
+        no gradient.
+
+        Parameters
+        ----------
+        snapshot : PyTree
+            A template time slice.
+
+        Returns
+        -------
+        PyTree
+            The accumulator's identity element.
+        """
+        ...
+
+    def fold(self, state: PyTree, value: Array) -> PyTree:
+        """Accumulate one snapshot's value into the running state.
+
+        Called in trajectory order, so an implementation may weight by
+        recency. Must be a fixed-shape pytree map, since it runs as a
+        ``lax.scan`` carry.
+
+        Parameters
+        ----------
+        state : PyTree
+            The running accumulator.
+        value : Array
+            ``(m,)`` result of :meth:`value` at the next snapshot.
+
+        Returns
+        -------
+        PyTree
+            The updated accumulator.
+        """
+        ...
+
+    def result(self, state: PyTree, num_steps: int) -> Array:
+        """Finish the reduction, given how many snapshots went into it.
+
+        Parameters
+        ----------
+        state : PyTree
+            The final accumulator.
+        num_steps : int
+            How many snapshots were folded. Static, so a normalization may
+            depend on it.
+
+        Returns
+        -------
+        Array
+            ``(m,)`` reduced observable, equal to the plain
+            :class:`Observable` call on the stacked trajectory.
         """
         ...
 

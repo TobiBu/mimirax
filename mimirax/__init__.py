@@ -26,6 +26,7 @@ from .inference import (  # noqa: E402
     HMC,
     METHODS,
     NUTS,
+    DataResampling,
     InferenceProblem,
     MadeToMeasure,
     MeanFieldVI,
@@ -67,6 +68,7 @@ from .parameters import (  # noqa: E402
 from .priors import PRIORS, EntropyPrior, GaussianPrior, L2Regularizer  # noqa: E402
 from .protocols import (  # noqa: E402
     Constraint,
+    FoldableObservable,
     ForceModel,
     ForwardModel,
     Likelihood,
@@ -81,8 +83,10 @@ from .types import FitResult, SampleResult  # noqa: E402
 __all__ = [
     "AffineTransform",
     "Constraint",
+    "DataResampling",
     "EntropyPrior",
     "FitResult",
+    "FoldableObservable",
     "ForceModel",
     "ForwardModel",
     "FunctionConstraint",

@@ -328,7 +328,11 @@ class MadeToMeasure:
         (final, _), trace = jax.lax.scan(
             _step, (start, opt_state), None, length=num_steps
         )
-        return final, trace
+        # `asarray` is for the type checker, not the runtime: CI's pyright sees a
+        # newer jax whose `lax.scan` output is inferred as `ArrayLike | Any`, and
+        # this function promises an `Array`. The local pyright does not, which is
+        # the difference the scaffold report records.
+        return final, jnp.asarray(trace)
 
     def minimize(
         self,
@@ -479,7 +483,7 @@ class MadeToMeasure:
 
 
 def made_to_measure(
-    learning_rate: float | Callable[[Array], Array] = 1.0e-2,
+    learning_rate: optax.ScalarOrSchedule = 1.0e-2,
     num_steps: int = 200,
     *,
     epsilon: float = 0.1,
@@ -501,8 +505,12 @@ def made_to_measure(
 
     Parameters
     ----------
-    learning_rate : float | Callable[[Array], Array]
+    learning_rate : optax.ScalarOrSchedule
         Adam's step size in the log-weight space, or an ``optax`` schedule --
+        the annotation is optax's own alias rather than a hand-written
+        ``float | Callable``, because a schedule takes ``chex.Numeric`` and not
+        ``Array``, and CI's pyright is stricter than the local one about the
+        difference (a difference the scaffold report already records). --
         ``optax.exponential_decay(0.05, 2000, 0.3)`` measured better on the
         tracer problem than any constant rate tried.
     num_steps : int

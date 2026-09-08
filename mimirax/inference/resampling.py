@@ -167,7 +167,9 @@ class DataResampling:
             samples, log_density = jax.lax.map(one, keys)
         else:
             samples, log_density = jax.vmap(one)(keys)
-        return SampleResult(samples=samples, log_density=log_density)
+        # `asarray` for the type checker: a newer jax infers the mapped output as
+        # `ArrayLike | Any` and `SampleResult.log_density` promises an `Array`.
+        return SampleResult(samples=samples, log_density=jnp.asarray(log_density))
 
     def covariance(self, samples: PyTree, key: str | None = "weights") -> Array:
         """Return the sample covariance of one leaf, the estimate of ``V``.

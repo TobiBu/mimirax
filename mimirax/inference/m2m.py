@@ -112,6 +112,21 @@ class MadeToMeasure:
         multiplicative update -- see the module docstring.
     keys : tuple[str, ...]
         Which leaves of a mapping ``params`` hold weights.
+    also_fit : tuple[str, ...]
+        Further leaves of ``params`` to treat as **free parameters**. Empty by
+        default, and that default is the method's definition rather than a
+        convenience: made-to-measure fits *weights*, at initial conditions the
+        caller fixed. Every other leaf of ``params`` -- the positions and
+        velocities a rollout needs -- is held constant and returned unchanged.
+
+        The default was not always this. An earlier version optimized every
+        leaf, so a fit handed ``{"positions", "velocities", "weights"}`` for 64
+        particles silently had **448** free parameters against ten observables
+        instead of 64, and moved the positions by 17 % and the velocities by
+        47 % while its docstring claimed to be recovering weights. Fitting the
+        initial conditions too is a legitimate thing to want -- Syer &
+        Tremaine's method extends to it -- but it is a different inference
+        problem, and it now has to be asked for by name.
     refine : optax.GradientTransformation | None
         An optional **second stage**, run from where the first one stopped:
         ``optax.lbfgs()`` is the intended use, and the reason the stage exists
@@ -131,6 +146,7 @@ class MadeToMeasure:
     epsilon: float = 0.1
     transform: Reparameterization = field(default_factory=LogTransform)
     keys: tuple[str, ...] = ("weights",)
+    also_fit: tuple[str, ...] = ()
     refine: optax.GradientTransformation | None = None
     refine_steps: int = 0
 
@@ -163,6 +179,43 @@ class MadeToMeasure:
                 f"params has {tuple(params)}. Pass keys=... to name the weights."
             )
         return present
+
+    def free_parameters(
+        self, params: PyTree
+    ) -> tuple[PyTree, Callable[[PyTree], PyTree]]:
+        """Split ``params`` into the free leaves and a function that puts them back.
+
+        The frozen leaves never enter the optimizer's state, so they cannot be
+        moved by it, cannot pick up an update from a stale moment estimate, and
+        cost nothing to carry. The rebuild preserves the caller's key order, so
+        :class:`~mimirax.types.FitResult` comes back in the structure it went in.
+
+        Parameters
+        ----------
+        params : PyTree
+            The parameters as the caller supplied them.
+
+        Returns
+        -------
+        tuple[PyTree, Callable[[PyTree], PyTree]]
+            The free subtree, and a function mapping a free subtree back into a
+            full parameter pytree. For a bare array the subtree *is* the array
+            and the rebuild is the identity.
+        """
+        if not isinstance(params, Mapping):
+            return params, lambda free: free
+        free_keys = tuple(self.weight_keys(params)) + tuple(
+            key for key in self.also_fit if key in params
+        )
+        free = {key: params[key] for key in params if key in free_keys}
+
+        def rebuild(updated: PyTree) -> PyTree:
+            return {
+                key: updated[key] if key in updated else value
+                for key, value in params.items()
+            }
+
+        return free, rebuild
 
     def to_unconstrained(self, params: PyTree) -> PyTree:
         """Map the weight leaves into the unconstrained space.
@@ -310,19 +363,27 @@ class MadeToMeasure:
         module's report carries the comparison, and its short version is that
         no rule wins on both of the method's two constructions.
 
+        **Only the weight leaves move**, plus anything named in
+        :attr:`also_fit`. Everything else in ``params`` is a fixed input to the
+        forward model -- the initial conditions a rollout integrates from -- and
+        comes back unchanged. That is what made-to-measure means, and getting it
+        wrong turns "recover 64 weights from ten observables" into a fit with
+        448 free parameters; see :attr:`also_fit`.
+
         Parameters
         ----------
         objective : Callable[[PyTree], Scalar]
             The time-averaged negative log posterior, a function of the
             constrained parameters.
         params : PyTree
-            The starting point, with positive weight leaves.
+            The starting point, with positive weight leaves. The frozen leaves
+            are still required here: the objective needs them.
 
         Returns
         -------
         FitResult
-            Constrained final parameters in the input's structure, and the
-            ``(num_steps,)`` objective trace.
+            Constrained final parameters in the input's structure, with the
+            frozen leaves untouched, and the objective trace.
 
         Raises
         ------
@@ -339,17 +400,20 @@ class MadeToMeasure:
         # Bound to a local so the None check above is visible to a type checker
         # inside the scan body, which closes over it.
         rule = self.optimizer
+        free, rebuild = self.free_parameters(params)
 
         def loss(unconstrained: PyTree) -> Scalar:
-            return objective(self.to_constrained(unconstrained))
+            return objective(rebuild(self.to_constrained(unconstrained)))
 
         final, trace = self._descend(
-            rule, loss, self.to_unconstrained(params), self.num_steps
+            rule, loss, self.to_unconstrained(free), self.num_steps
         )
         if self.refine is not None and self.refine_steps > 0:
             final, refined = self._descend(self.refine, loss, final, self.refine_steps)
             trace = jnp.concatenate([trace, refined])
-        return FitResult(params=self.to_constrained(final), objective_trace=trace)
+        return FitResult(
+            params=rebuild(self.to_constrained(final)), objective_trace=trace
+        )
 
     def force_of_change(
         self,
@@ -420,6 +484,7 @@ def made_to_measure(
     *,
     epsilon: float = 0.1,
     keys: tuple[str, ...] = ("weights",),
+    also_fit: tuple[str, ...] = (),
     refine: optax.GradientTransformation | None = None,
     refine_steps: int = 0,
 ) -> MadeToMeasure:
@@ -446,6 +511,8 @@ def made_to_measure(
         The classic force of change's step size.
     keys : tuple[str, ...]
         Which leaves of a mapping ``params`` hold weights.
+    also_fit : tuple[str, ...]
+        Further leaves to treat as free parameters; empty means weights only.
     refine : optax.GradientTransformation | None
         An optional second-stage rule, e.g. ``optax.lbfgs()``.
     refine_steps : int
@@ -462,6 +529,7 @@ def made_to_measure(
         num_steps=num_steps,
         epsilon=epsilon,
         keys=keys,
+        also_fit=also_fit,
         refine=refine,
         refine_steps=refine_steps,
     )

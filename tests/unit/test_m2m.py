@@ -258,29 +258,65 @@ def test_minimize_stays_positive_and_lowers_the_objective(degenerate_problem) ->
     assert set(result.params) == {"weights"}
 
 
-def test_minimize_leaves_non_weight_leaves_in_their_own_space(
-    degenerate_problem,
-) -> None:
-    """Only the named leaves are reparameterized; the rest are optimized as they are.
+def test_minimize_moves_the_weights_and_nothing_else(degenerate_problem) -> None:
+    """Made-to-measure fits weights. Every other leaf comes back untouched.
 
-    A made-to-measure fit that also moves the initial conditions must not push
-    positions through a positivity transform, and this is the test that says so:
-    a ``"positions"`` leaf starting at zero would be ``-inf`` in log space and
-    the fit would return ``nan`` if it were transformed.
+    This is a regression test for a real defect. `minimize` used to optimize
+    *every* leaf of ``params``, so a fit handed the ``{"positions",
+    "velocities", "weights"}`` dict a rollout needs silently had **448** free
+    parameters for 64 particles instead of 64 -- against ten observables -- and
+    moved the positions by 17 % and the velocities by 47 % while its docstring
+    said it was recovering weights. Every recovery and convergence number
+    measured before the fix was a number about a different, much larger
+    inference problem.
+
+    Asserted **exactly zero** movement, not a tolerance: a frozen leaf never
+    enters the optimizer's state, so there is no update to be small.
     """
     problem, _, start, _, _ = degenerate_problem
-    params = {"weights": start["weights"], "offset": jnp.zeros(2)}
+    params = {
+        "weights": start["weights"],
+        "offset": jnp.asarray([3.0, -1.0]),
+        "label": jnp.zeros(4),
+    }
 
     def objective(p):
         return problem.negative_log_posterior({"weights": p["weights"]}) + jnp.sum(
             p["offset"] ** 2
         )
 
-    result = made_to_measure(learning_rate=0.05, num_steps=50).minimize(
+    result = made_to_measure(0.05, 200).minimize(objective, params)
+    assert jnp.array_equal(result.params["offset"], params["offset"])
+    assert jnp.array_equal(result.params["label"], params["label"])
+    assert not jnp.array_equal(result.params["weights"], params["weights"])
+    assert list(result.params) == list(params)
+
+
+def test_also_fit_opts_into_the_larger_inference_problem(degenerate_problem) -> None:
+    """Fitting more than the weights is legitimate, and has to be asked for.
+
+    Syer & Tremaine's method extends to the initial conditions, and
+    :attr:`~mimirax.inference.MadeToMeasure.also_fit` is how that is spelled. It
+    also checks the reparameterization stays off those leaves: an ``offset``
+    starting at zero would be ``-inf`` in log space, so a fit that returns
+    finite values here is a fit that transformed only the weights.
+    """
+    problem, _, start, _, _ = degenerate_problem
+    params = {"weights": start["weights"], "offset": jnp.zeros(2)}
+
+    def objective(p):
+        return problem.negative_log_posterior({"weights": p["weights"]}) + jnp.sum(
+            (p["offset"] - 2.0) ** 2
+        )
+
+    result = made_to_measure(0.05, 400, also_fit=("offset",)).minimize(
         objective, params
     )
     assert jnp.all(jnp.isfinite(result.params["offset"]))
     assert jnp.all(jnp.isfinite(result.params["weights"]))
+    assert jnp.all(result.params["weights"] > 0.0)
+    # It moved toward 2.0, so the leaf really was free.
+    assert float(jnp.min(result.params["offset"])) > 0.5
 
 
 def test_a_bare_array_of_weights_round_trips_through_both_iterations() -> None:

@@ -68,6 +68,7 @@ from dataclasses import dataclass, field
 import jax
 import jax.numpy as jnp
 import optax
+from jax import Array
 
 from mimirax._typing import PyTree, Scalar
 from mimirax.parameters import LogTransform
@@ -111,6 +112,18 @@ class MadeToMeasure:
         multiplicative update -- see the module docstring.
     keys : tuple[str, ...]
         Which leaves of a mapping ``params`` hold weights.
+    refine : optax.GradientTransformation | None
+        An optional **second stage**, run from where the first one stopped:
+        ``optax.lbfgs()`` is the intended use, and the reason the stage exists
+        is that a quasi-Newton rule needs a starting point in the right basin
+        more than it needs many steps. ``None`` (the default) runs one stage.
+        Whether two stages beat one is a property of the problem and is
+        measured, not assumed -- on both of this module's test problems the
+        best single-stage fit beats the two-stage one; see
+        ``reports/M2M_module.md``.
+    refine_steps : int
+        Steps for the second stage. Static. Ignored when :attr:`refine` is
+        ``None``; a quasi-Newton stage wants tens, not thousands.
     """
 
     optimizer: optax.GradientTransformation | None = None
@@ -118,6 +131,8 @@ class MadeToMeasure:
     epsilon: float = 0.1
     transform: Reparameterization = field(default_factory=LogTransform)
     keys: tuple[str, ...] = ("weights",)
+    refine: optax.GradientTransformation | None = None
+    refine_steps: int = 0
 
     def weight_keys(self, params: PyTree) -> tuple[str, ...]:
         """Return which leaves of ``params`` are weights.
@@ -193,6 +208,75 @@ class MadeToMeasure:
             for key, value in unconstrained.items()
         }
 
+    def _descend(
+        self,
+        rule: optax.GradientTransformation,
+        loss: Callable[[PyTree], Scalar],
+        start: PyTree,
+        num_steps: int,
+    ) -> tuple[PyTree, Array]:
+        """Run one optax rule for ``num_steps`` in the unconstrained space.
+
+        Supports rules whose ``update`` needs more than a gradient. optax's
+        quasi-Newton and line-search rules are
+        ``GradientTransformationExtraArgs``: their ``update`` takes ``value``,
+        ``grad`` and ``value_fn`` as well, because a line search has to
+        *evaluate* the objective at trial points rather than only read its
+        gradient. Passing them is what makes ``optax.lbfgs()`` usable here at
+        all; without it the call raises a ``TypeError`` naming the three missing
+        arguments. They are supplied to every ``ExtraArgs`` rule -- which today
+        is all of them, Adam included -- and rules that do not want them ignore
+        them.
+
+        When the rule's state already *carries* a cached ``value`` and ``grad``
+        (``optax.lbfgs``'s does; Adam's does not),
+        :func:`optax.value_and_grad_from_state` reads them instead of
+        recomputing. That is not a micro-optimization here: one recomputation
+        per step is one extra N-body rollout and its backward pass, which is the
+        dominant cost of the whole fit.
+
+        Parameters
+        ----------
+        rule : optax.GradientTransformation
+            The update rule.
+        loss : Callable[[PyTree], Scalar]
+            The objective, as a function of *unconstrained* parameters.
+        start : PyTree
+            Starting point, unconstrained.
+        num_steps : int
+            How many updates to take. Static.
+
+        Returns
+        -------
+        tuple[PyTree, Array]
+            The final unconstrained parameters and the ``(num_steps,)``
+            objective trace, recorded before each update.
+        """
+        opt_state = rule.init(start)
+        extra = isinstance(rule, optax.GradientTransformationExtraArgs)
+        cached = extra and optax.tree_utils.tree_get(opt_state, "value") is not None
+        value_and_grad = (
+            optax.value_and_grad_from_state(loss)
+            if cached
+            else jax.value_and_grad(loss)
+        )
+
+        def _step(carry, _):
+            current, state = carry
+            if cached:
+                value, grads = value_and_grad(current, state=state)
+            else:
+                value, grads = value_and_grad(current)
+            kwargs = {"value": value, "grad": grads, "value_fn": loss} if extra else {}
+            updates, state = rule.update(grads, state, current, **kwargs)
+            current = optax.apply_updates(current, updates)
+            return (current, state), value
+
+        (final, _), trace = jax.lax.scan(
+            _step, (start, opt_state), None, length=num_steps
+        )
+        return final, trace
+
     def minimize(
         self,
         objective: Callable[[PyTree], Scalar],
@@ -210,11 +294,21 @@ class MadeToMeasure:
         itself. Optimizing without it finds the maximum of the constrained
         posterior, which is what a made-to-measure fit is asking for.
 
-        The whole loop is one ``lax.scan``, as
-        :class:`~mimirax.inference.OptaxOptimizer`'s is, so a fit that
-        differentiates through an N-body rollout traces once. The trace records
-        the objective *before* each update, so ``objective_trace[0]`` is the
-        starting value.
+        Each stage is one ``lax.scan``, as
+        :class:`~mimirax.inference.OptaxOptimizer`'s loop is, so a fit that
+        differentiates through an N-body rollout traces once per stage. The
+        trace records the objective *before* each update, so
+        ``objective_trace[0]`` is the starting value; with a :attr:`refine`
+        stage the two traces are concatenated and the trace is
+        ``num_steps + refine_steps`` long.
+
+        Any optax rule works, including a **learning-rate schedule**
+        (``optax.adam(optax.cosine_decay_schedule(...))``) and the quasi-Newton
+        and line-search rules whose ``update`` needs the objective's value and
+        the objective itself -- see :meth:`_descend`. Which rule to use is a
+        property of the problem and is measured rather than asserted; the
+        module's report carries the comparison, and its short version is that
+        no rule wins on both of the method's two constructions.
 
         Parameters
         ----------
@@ -245,22 +339,16 @@ class MadeToMeasure:
         # Bound to a local so the None check above is visible to a type checker
         # inside the scan body, which closes over it.
         rule = self.optimizer
-        start = self.to_unconstrained(params)
-        value_and_grad = jax.value_and_grad(
-            lambda unconstrained: objective(self.to_constrained(unconstrained))
-        )
-        opt_state = rule.init(start)
 
-        def _step(carry, _):
-            current, state = carry
-            value, grads = value_and_grad(current)
-            updates, state = rule.update(grads, state, current)
-            current = optax.apply_updates(current, updates)
-            return (current, state), value
+        def loss(unconstrained: PyTree) -> Scalar:
+            return objective(self.to_constrained(unconstrained))
 
-        (final, _), trace = jax.lax.scan(
-            _step, (start, opt_state), None, length=self.num_steps
+        final, trace = self._descend(
+            rule, loss, self.to_unconstrained(params), self.num_steps
         )
+        if self.refine is not None and self.refine_steps > 0:
+            final, refined = self._descend(self.refine, loss, final, self.refine_steps)
+            trace = jnp.concatenate([trace, refined])
         return FitResult(params=self.to_constrained(final), objective_trace=trace)
 
     def force_of_change(
@@ -327,24 +415,41 @@ class MadeToMeasure:
 
 
 def made_to_measure(
-    learning_rate: float = 1.0e-2,
+    learning_rate: float | Callable[[Array], Array] = 1.0e-2,
     num_steps: int = 200,
     *,
     epsilon: float = 0.1,
     keys: tuple[str, ...] = ("weights",),
+    refine: optax.GradientTransformation | None = None,
+    refine_steps: int = 0,
 ) -> MadeToMeasure:
     """Build a made-to-measure method with an Adam rule, as :func:`~mimirax.adam` does.
 
+    Adam is the default because it is the default everywhere, not because it is
+    the best rule for this objective -- on the module's tracer problem plain
+    ``optax.sgd(1e-6)`` reaches a gradient norm an order of magnitude smaller,
+    and ``optax.lbfgs()`` reaches a lower objective in fifty steps than Adam
+    does in ten thousand. Neither transfers to the self-consistent problem,
+    where a fixed-step SGD diverges outright. Pass ``optimizer=`` to
+    :class:`MadeToMeasure` directly for anything other than Adam, and read the
+    measured comparison in ``reports/M2M_module.md`` before choosing.
+
     Parameters
     ----------
-    learning_rate : float
-        Adam's step size, in the log-weight space.
+    learning_rate : float | Callable[[Array], Array]
+        Adam's step size in the log-weight space, or an ``optax`` schedule --
+        ``optax.exponential_decay(0.05, 2000, 0.3)`` measured better on the
+        tracer problem than any constant rate tried.
     num_steps : int
         Number of weight updates.
     epsilon : float
         The classic force of change's step size.
     keys : tuple[str, ...]
         Which leaves of a mapping ``params`` hold weights.
+    refine : optax.GradientTransformation | None
+        An optional second-stage rule, e.g. ``optax.lbfgs()``.
+    refine_steps : int
+        Steps for the second stage.
 
     Returns
     -------
@@ -357,4 +462,6 @@ def made_to_measure(
         num_steps=num_steps,
         epsilon=epsilon,
         keys=keys,
+        refine=refine,
+        refine_steps=refine_steps,
     )

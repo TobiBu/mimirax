@@ -10,8 +10,14 @@ from mimirax import OBSERVABLES, IdentityObservable, ProjectedPositions, make_ob
 
 
 def test_registry_and_factory() -> None:
-    """Both reference observables are registered and constructible by name."""
-    assert OBSERVABLES.available() == ("identity", "projected_positions")
+    """Every shipped observable is registered and constructible by name."""
+    assert OBSERVABLES.available() == (
+        "gaussian_radial_bins",
+        "identity",
+        "projected_positions",
+        "time_average",
+        "weighted_kernel_sum",
+    )
     assert isinstance(make_observable("identity"), IdentityObservable)
     obs = make_observable("projected_positions", axes=(2,))
     assert isinstance(obs, ProjectedPositions) and obs.axes == (2,)

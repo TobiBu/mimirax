@@ -31,12 +31,16 @@ from .inference import (  # noqa: E402
     NelderMead,
     OptaxOptimizer,
     adam,
+    made_to_measure,
 )
 from .likelihoods import LIKELIHOODS, GaussianLikelihood, chi_squared  # noqa: E402
 from .observables import (  # noqa: E402
     OBSERVABLES,
+    GaussianRadialBins,
     IdentityObservable,
     ProjectedPositions,
+    TimeAverage,
+    WeightedKernelSum,
     make_observable,
 )
 from .parameters import (  # noqa: E402
@@ -83,6 +87,7 @@ __all__ = [
     "FunctionConstraint",
     "GaussianLikelihood",
     "GaussianPrior",
+    "GaussianRadialBins",
     "HMC",
     "IdentityObservable",
     "IdentityTransform",
@@ -109,7 +114,9 @@ __all__ = [
     "SampleResult",
     "Sampler",
     "SoftplusTransform",
+    "TimeAverage",
     "TotalMassConstraint",
+    "WeightedKernelSum",
     "adam",
     "centre_of_mass",
     "chi_squared",
@@ -119,6 +126,7 @@ __all__ = [
     "fisher_information",
     "has_converged",
     "log_abs_det_jacobian",
+    "made_to_measure",
     "make_observable",
     "net_momentum",
     "normalized_residuals",

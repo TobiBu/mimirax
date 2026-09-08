@@ -5,12 +5,13 @@ from __future__ import annotations
 import builtins
 import sys
 
+import jax
 import jax.numpy as jnp
 import pytest
 
 from mimirax import ForceModel, ForwardModel
 from mimirax.adapters.jaccpot import JaccpotForceModel
-from mimirax.adapters.nornax import NornaxRollout
+from mimirax.adapters.nornax import NornaxRollout, SingleRungMutualForce
 from mimirax.adapters.odisseo import OdisseoForwardModel
 from mimirax.testing import DirectSumGravity
 
@@ -63,13 +64,100 @@ def test_jaccpot_from_preset_wraps_a_solver_when_present(monkeypatch) -> None:
     assert model.solver.kwargs == {"preset": "fast", "theta": 0.6}
 
 
-def test_rollout_and_odisseo_adapters_are_forward_model_stubs() -> None:
-    """Both have the ForwardModel shape and raise until their decisions land."""
-    rollout = NornaxRollout(force=DirectSumGravity(), dt=0.01, num_steps=10)
-    assert isinstance(rollout, ForwardModel)
-    with pytest.raises(NotImplementedError, match="D-026"):
-        rollout({"positions": jnp.zeros((2, 3))})
+def test_odisseo_adapter_is_a_forward_model_stub() -> None:
+    """It has the ForwardModel shape and raises until decision O-4 lands."""
     odisseo = OdisseoForwardModel(config=None, params=None)
     assert isinstance(odisseo, ForwardModel)
     with pytest.raises(NotImplementedError, match="O-4"):
         odisseo({})
+
+
+# --- the nornax rollout adapter, without nornax installed --------------------------
+#
+# Everything below runs on a machine that has no solver: nornax is imported
+# inside the rollout, so the adapter's construction-time contract -- which
+# force can drive which k_max, which leaf is the dynamical mass, the
+# single-rung bridge's refusal above level 0 -- is checked here, in CI, and only
+# the integration itself waits for the extra
+# (``tests/integration/test_m2m_rollout.py``).
+
+
+def test_rollout_is_a_forward_model_and_needs_nornax_to_run() -> None:
+    """The shape is a ForwardModel; calling it without nornax names the extra."""
+    rollout = NornaxRollout.tracer(DirectSumGravity(), dt=0.01, num_steps=10)
+    assert isinstance(rollout, ForwardModel)
+    real_import = builtins.__import__
+
+    def _no_nornax(name, *args, **kwargs):
+        if name.startswith("nornax"):
+            raise ImportError("no module named nornax")
+        return real_import(name, *args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as patch:
+        for module in [key for key in sys.modules if key.startswith("nornax")]:
+            patch.delitem(sys.modules, module, raising=False)
+        patch.setattr(builtins, "__import__", _no_nornax)
+        with pytest.raises(ImportError, match=r"mimirax\[nornax\]"):
+            rollout({"positions": jnp.zeros((2, 3))})
+
+
+def test_the_two_constructions_differ_only_in_where_the_weights_go() -> None:
+    """self_consistent puts the weights in the dynamics; tracer keeps them out."""
+    params = {
+        "positions": jnp.zeros((3, 3)),
+        "velocities": jnp.zeros((3, 3)),
+        "weights": jnp.asarray([1.0, 2.0, 3.0]),
+    }
+    consistent = NornaxRollout.self_consistent(DirectSumGravity(), dt=0.01, num_steps=4)
+    assert consistent.weights_are_masses
+    assert jnp.array_equal(consistent.dynamical_masses(params), params["weights"])
+
+    tracer = NornaxRollout.tracer(DirectSumGravity(), dt=0.01, num_steps=4)
+    assert not tracer.weights_are_masses
+    assert tracer.k_max == 0
+    # No masses given: unit test particles, which is what an external field wants.
+    assert jnp.array_equal(tracer.dynamical_masses(params), jnp.ones(3))
+    given = NornaxRollout.tracer(
+        DirectSumGravity(), dt=0.01, num_steps=4, masses=jnp.full(3, 0.5)
+    )
+    assert jnp.array_equal(given.dynamical_masses(params), jnp.full(3, 0.5))
+
+
+def test_a_mimirax_force_model_is_rejected_above_a_single_rung() -> None:
+    """k_max > 0 needs a real MutualForceModel, and the error says which ones."""
+    with pytest.raises(ValueError, match="SingleRungMutualForce"):
+        NornaxRollout(force=DirectSumGravity(), dt=0.01, num_steps=4, k_max=1)
+    with pytest.raises(ValueError, match="num_steps must be >= 1"):
+        NornaxRollout(force=DirectSumGravity(), dt=0.01, num_steps=0)
+
+
+def test_the_bridge_is_the_total_force_at_level_zero_and_refuses_the_rest() -> None:
+    """Level 0 is the wrapped model's total; any other level raises."""
+    force = DirectSumGravity(softening=0.1)
+    bridge = SingleRungMutualForce(force)
+    positions = jnp.asarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 2.0, 0.0]])
+    masses = jnp.asarray([1.0, 2.0, 0.5])
+    rung = jnp.zeros(3, dtype=jnp.int32)
+    got = bridge.level_accelerations(positions, masses, rung=rung, level=0)
+    assert jnp.array_equal(got, force.accelerations(positions, masses))
+    with pytest.raises(ValueError, match="k_max=0 bridge"):
+        bridge.level_accelerations(positions, masses, rung=rung, level=1)
+
+
+def test_the_bridge_is_transparent_to_gradients() -> None:
+    """Wrapping must not change a derivative; it is a rename, not a computation."""
+    force = DirectSumGravity(softening=0.1)
+    bridge = SingleRungMutualForce(force)
+    positions = jnp.asarray([[0.1, 0.0, 0.0], [1.0, 0.3, 0.0], [0.0, 2.0, 0.4]])
+    masses = jnp.asarray([1.0, 2.0, 0.5])
+    rung = jnp.zeros(3, dtype=jnp.int32)
+
+    def direct(m):
+        return jnp.sum(force.accelerations(positions, m) ** 2)
+
+    def bridged(m):
+        return jnp.sum(
+            bridge.level_accelerations(positions, m, rung=rung, level=0) ** 2
+        )
+
+    assert jnp.allclose(jax.grad(direct)(masses), jax.grad(bridged)(masses), atol=1e-14)

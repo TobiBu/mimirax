@@ -55,6 +55,8 @@ jobs:
           pytest -o addopts="" --no-header -q
           tests/unit/test_parameters.py
           tests/unit/test_testing_doubles.py
+          tests/unit/test_observables_m2m.py
+          tests/unit/test_m2m.py
           tests/integration/test_recover_linear_truth.py
 
       - name: Build documentation

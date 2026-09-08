@@ -17,7 +17,6 @@ from mimirax import (
     IdentityObservable,
     InferenceProblem,
     L2Regularizer,
-    MadeToMeasure,
     MeanFieldVI,
     NelderMead,
     OptaxOptimizer,
@@ -92,13 +91,16 @@ def test_optax_optimizer_preserves_pytree_structure_and_is_jittable() -> None:
 
 
 def test_stub_methods_raise_not_implemented() -> None:
-    """Every stub fixes its signature and raises, so a caller learns early."""
+    """Every stub fixes its signature and raises, so a caller learns early.
+
+    MadeToMeasure is no longer among them: it landed with the made-to-measure
+    module and is exercised in ``tests/unit/test_m2m.py``.
+    """
     log_density = lambda p: -jnp.sum(p**2)  # noqa: E731
     params = jnp.zeros(2)
     key = jax.random.PRNGKey(0)
     for sampler in (HMC(), NUTS(), MeanFieldVI()):
         with pytest.raises(NotImplementedError):
             sampler.sample(log_density, params, key=key, num_samples=4)
-    for optimizer in (NelderMead(), MadeToMeasure()):
-        with pytest.raises(NotImplementedError):
-            optimizer.minimize(log_density, params)
+    with pytest.raises(NotImplementedError):
+        NelderMead().minimize(log_density, params)

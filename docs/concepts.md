@@ -109,6 +109,39 @@ schedule tried plateaus 2 % short of it while LBFGS reaches it and the classic f
 reaches it to `3e-8`. At this conditioning the optimizer choice is not a speed question, so
 `MadeToMeasure` requires one rather than picking.
 
+**Memory, and the foldable observable.** A time average is a *reduction*, so stacking the
+trajectory to average it afterwards is the expensive way round: `6·t·n` doubles in the forward
+pass alone, before autodiff. `FoldableObservable` is the capability that lets a reduction be
+accumulated one snapshot at a time instead — a separate protocol, not a widening of `Observable`,
+and narrower than it (a mean folds, exponential smoothing folds, a median does not). `TimeAverage`
+satisfies both, and the *fold law* — folding equals averaging the stacked trajectory — is tested
+to round-off, so the two paths are interchangeable and a caller chooses on memory alone.
+`mimirax.adapters.nornax.FoldedRollout` exploits it: it folds the observable into the rollout and
+runs the integration as checkpointed segments, which took the peak scratch for one gradient from
+**27.1 MB to 1.5 MB** at `t = 1024` — measured with XLA's own accounting, with the gradient
+unchanged to `6e-15`. `FoldedRollout.balanced` picks the `√t` segment count that minimises it.
+The price is that the forward model then knows about the observable, which is why it is a
+separate, explicitly named class rather than a flag.
+
+**Uncertainties on the weights.** `DataResampling` is Algorithm 1 of Bovy, Kawata & Hunt (2018):
+perturb the data by its own uncertainty, refit, keep the fit. Each draw is an *exact* posterior
+sample for a linear-Gaussian model under a uniform prior — no chain, no step size, no acceptance
+rate — and the made-to-measure observable *is* linear in the weights. Its domain is stated and
+measured rather than assumed: the sample covariance converges to the analytic
+`(KᵀS⁻¹K)⁻¹` at the Monte Carlo rate; with a prior active it is too narrow by roughly
+`effective_parameters / d`, which is why that diagnostic is worth running first; and where the
+positivity constraint binds appreciably neither the constrained nor the unconstrained variant is
+usable. It deliberately does not claim the `Sampler` protocol, because it cannot work from a
+scalar log density — it has to reach inside the posterior to find the data.
+
+**A parallel approach, not implemented.** GalIC (Yurin & Springel 2014) reaches the same goal — a
+stationary N-body realisation matching a target — by adjusting particle *velocities* rather than
+weights, with a merit function on the time-averaged density response and no derivatives at all
+(stochastic hill-climbing). Its free parameters are the initial conditions, which is
+`MadeToMeasure(also_fit=("velocities",))` here, so its objective is expressible in this package
+*and* differentiable where GalIC had no gradient available. Nothing in `mimirax` tests that, and
+it is recorded as a direction rather than a claim.
+
 **What the module does not claim.** That a given time-average window is long enough, that a given
 `mu` is well chosen, or that any of this converges at FMM scale. Those are Jaccpot-Dynamics I's
 experiments. What *is* measured lives in the tests' docstrings and in the module's report:
@@ -122,8 +155,9 @@ tuned away.
 Implemented and tested: parameters (`ravel`, four reparameterizations, gauge fixing,
 constraints), the reference observables, the made-to-measure observables (`WeightedKernelSum`,
 `TimeAverage`, `GaussianRadialBins`), the Gaussian likelihood, the Gaussian, L2 and entropy
-priors, `InferenceProblem`, `OptaxOptimizer`, `MadeToMeasure`, the residual / convergence /
-Fisher diagnostics, the `nornax` rollout adapter, and the three test doubles.
+priors, `InferenceProblem`, `OptaxOptimizer`, `MadeToMeasure`, `DataResampling` for weight
+uncertainties, the residual / convergence / Fisher / `effective_parameters` diagnostics, the
+`nornax` rollout adapter with `FoldedRollout`, and the three test doubles.
 
 Stubs that fix a name and a signature and raise `NotImplementedError`: `HMC`, `NUTS`,
 `MeanFieldVI`, `NelderMead`, `profile_likelihood`, and the ODISSEO adapter.

@@ -65,6 +65,11 @@ solver-specific glue is in `mimirax/adapters/`, behind optional extras.
 - The made-to-measure pieces as ordinary registered parts: `WeightedKernelSum`
   (`y_j = sum_i w_i K_j(z_i)`), `TimeAverage` (plain mean or exponential smoothing),
   `EntropyPrior`, and `NornaxRollout` as a `ForwardModel` behind `mimirax[nornax]`
+- `DataResampling`: uncertainties on the weights by Bovy, Kawata & Hunt's Algorithm 1 — exact
+  posterior draws for a linear-Gaussian model, with its two approximations measured, not assumed
+- `FoldableObservable` and `FoldedRollout`: a time average accumulated *inside* the integration,
+  in checkpointed segments. 27.1 MB → 1.5 MB of gradient scratch at 1024 base steps, with the
+  gradient unchanged to `6e-15`
 - Analytic test doubles with closed-form gradients (`mimirax.testing`): a linear model, a
   softened point-mass field with its tidal tensor, direct-sum self-gravity
 - Stubs with fixed signatures for HMC, NUTS, mean-field VI, Nelder–Mead and the ODISSEO adapter

@@ -84,6 +84,10 @@ Inference
    :members:
    :undoc-members:
 
+.. automodule:: mimirax.inference.resampling
+   :members:
+   :undoc-members:
+
 Diagnostics
 -----------
 

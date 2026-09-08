@@ -13,6 +13,7 @@ enable_runtime_typecheck()
 from ._registry import Registry  # noqa: E402
 from .diagnostics import (  # noqa: E402
     degenerate_directions,
+    effective_parameters,
     fisher_information,
     has_converged,
     normalized_residuals,
@@ -123,6 +124,7 @@ __all__ = [
     "constrain",
     "constraint_violation",
     "degenerate_directions",
+    "effective_parameters",
     "fisher_information",
     "has_converged",
     "log_abs_det_jacobian",

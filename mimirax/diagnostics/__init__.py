@@ -7,6 +7,7 @@ momentum conservation belong to the integrator package (``nornax.diagnostics``).
 from mimirax.diagnostics.convergence import has_converged, relative_change
 from mimirax.diagnostics.degeneracy import (
     degenerate_directions,
+    effective_parameters,
     fisher_information,
     profile_likelihood,
 )
@@ -14,6 +15,7 @@ from mimirax.diagnostics.residuals import normalized_residuals, residuals, rms_r
 
 __all__ = [
     "degenerate_directions",
+    "effective_parameters",
     "fisher_information",
     "has_converged",
     "normalized_residuals",

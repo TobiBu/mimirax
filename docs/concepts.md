@@ -80,14 +80,37 @@ the first is measured against. The bracket the classic algorithm assembles by ha
 differ only in the metric they descend in. A test pins the autodiff gradient against the
 hand-written bracket, and another measures the two iterations against each other.
 
+**What the weights are.** Not stars. A made-to-measure particle is a Monte Carlo sample of a
+distribution function, and its weight is the mass carried on that orbit — so the method fits an
+*orbit distribution*, and `params["weights"]` is that. In the tracer construction the weights are
+the tracer population's only; in the self-consistent one they are simultaneously the orbit
+occupation and the source of the gravity, which is what "self-consistent" means and also what the
+construction cannot yet separate (a luminous weight and a dynamical mass fitted independently is
+not expressible — see the module's report).
+
+**What is fitted.** The weights, and nothing else unless asked: `MadeToMeasure.also_fit` opts into
+the initial conditions. That default is the method's definition, not a convenience.
+
+**How informative the objective is, as a number.** `effective_parameters(data_curvature,
+prior_curvature)` returns `tr(H_data (H_data + H_prior)^-1)`, the effective degrees of freedom the
+*data* determined. On the module's tracer problem — 64 weights, 10 observables — it returns
+**9.9999**, while the fit reaches a `chi²` of `1.4e-8`. Ten numbers in, ten degrees of freedom
+out; the other 54 are the prior's. No optimizer, step size or `mu` moves that, so "make the
+objective more informative" means more or better observables and nothing else.
+
+**The conditioning is the practical problem.** The objective is *strictly convex* in the weights,
+so the minimum is unique — but the Fisher condition number is 2.6e7, and every Adam rate and
+schedule tried plateaus 2 % short of it while LBFGS reaches it and the classic force of change
+reaches it to `3e-8`. At this conditioning the optimizer choice is not a speed question, so
+`MadeToMeasure` requires one rather than picking.
+
 **What the module does not claim.** That a given time-average window is long enough, that a given
 `mu` is well chosen, or that any of this converges at FMM scale. Those are Jaccpot-Dynamics I's
 experiments. What *is* measured lives in the tests' docstrings and in the module's report:
-gradients through the rollout against finite differences with the measured `|AD - FD|` versus `h`
-curve quoted, recovery residuals, and the degeneracy of each test problem read off the Fisher
-information rather than tuned away. On the recovery problems the fit is essentially perfect and
-the weights are *not* recovered, because ten observables cannot determine sixty-four weights —
-that is the reported result, and the diagnostics that say so ship with it.
+gradients through the rollout against a closed form with no autodiff in it, against forward-mode
+autodiff, and against finite differences with the `|AD - FD|` versus `h` curves quoted; recovery
+residuals; and the degeneracy of each test problem read off the Fisher information rather than
+tuned away.
 
 ## What is implemented and what is a stub
 

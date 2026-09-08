@@ -56,8 +56,9 @@ solver-specific glue is in `mimirax/adapters/`, behind optional extras.
 - `InferenceProblem`: forward model + observable + likelihood + priors -> one differentiable
   log posterior
 - `OptaxOptimizer`: any `optax` update rule in a `lax.scan`, jittable end to end
-- Diagnostics: residuals, convergence from the objective trace, Fisher information and its
-  degenerate directions
+- Diagnostics: residuals, convergence from the objective trace, Fisher information, its
+  degenerate directions, and `effective_parameters` — how many parameters the *data* determined,
+  which on a regularized fit is the number that says whether the objective is informative
 - Made-to-measure, in two variants on one objective: `MadeToMeasure.minimize` differentiates
   the time-averaged posterior *through the orbit integration*; `MadeToMeasure.force_of_change`
   is Syer & Tremaine's classic weight update, kept as the oracle the first is measured against
@@ -136,9 +137,11 @@ reference. Every piece is an ordinary part of the scaffold, so the objective is 
 import jax
 import jax.numpy as jnp
 
+import optax
+
 from mimirax import (
     EntropyPrior, GaussianLikelihood, GaussianRadialBins, InferenceProblem,
-    TimeAverage, WeightedKernelSum, made_to_measure,
+    MadeToMeasure, TimeAverage, WeightedKernelSum, effective_parameters,
 )
 from mimirax.adapters.nornax import NornaxRollout
 from mimirax.testing import SoftenedPointMassField
@@ -166,21 +169,36 @@ problem = InferenceProblem(
     likelihood=GaussianLikelihood(sigma=0.05), observed=observed,
     priors=(EntropyPrior(mu=1e-3),),
 )
-fit = made_to_measure(learning_rate=0.002, num_steps=20_000).minimize(
+# LBFGS, not Adam: this objective's Fisher condition number is 1.8e7, and a
+# first-order rule does not reach the minimum at that conditioning. `minimize`
+# fits the WEIGHTS -- positions and velocities are inputs and come back untouched.
+fit = MadeToMeasure(optimizer=optax.lbfgs(), num_steps=200).minimize(
     problem.negative_log_posterior, {**state, "weights": jnp.ones(n)}
 )
 print(fit.objective_trace[0], "->", fit.objective_trace[-1])
 ```
 
 Read the fit with the diagnostics, not with hope. On this problem, measured: `chi²` falls from
-`1.74e3` to `5.4e-5` and the weights end **26 % away** from `truth`. Five bins times two moments
-cannot determine sixty-four weights, and `fisher_information` / `degenerate_directions` say so —
-55 of the 64 directions sit below `1e-3` of the largest eigenvalue, and the smallest **is** `mu`,
-the prior's own curvature, with no contribution from the data at all. A perfect fit and
-unrecovered weights is the normal state of a made-to-measure problem; the diagnostics that tell
-you which you have ship with the method. The learning rate matters too: at `0.02` this same fit
-reaches `chi² = 4.1` and stops improving, so read `fit.objective_trace`, which is returned for
-that. Measured numbers for every problem in the suite are in the tests' docstrings.
+`1.74e3` to **`8.5e-9`** and the weights still end **23 % away** from `truth`. That is not a
+convergence failure — the objective is strictly convex in the weights, so it has a *unique*
+minimum, and 23 % is where that minimum sits. It is a statement about how much the data say:
+
+```python
+print(effective_parameters(data_curvature, prior_curvature))   # -> 9.9999, out of 64 weights
+```
+
+Ten observables determine **ten** degrees of freedom. The other 54 are the entropy prior's
+answer, and no optimizer, step size or `mu` changes that — the smallest Fisher eigenvalue **is**
+`mu`, with no contribution from the data at all. A perfect `chi²` alongside unrecovered weights is
+the normal state of a made-to-measure problem, so `mimirax` ships the diagnostics that tell you
+which one you have: `effective_parameters` for how many parameters the data determined, and
+`fisher_information` / `degenerate_directions` for which ones.
+
+The optimizer matters as much as the objective. At a Fisher condition number of 1.8e7 every Adam
+rate and schedule tried plateaus 2 % short of the minimum, while LBFGS reaches it — so pass a
+well-conditioned rule and read `fit.objective_trace`, which is returned for exactly this.
+Measured numbers for every problem in the suite are in the tests' docstrings and in
+`reports/M2M_module.md`.
 
 `NornaxRollout.self_consistent` is the other construction: the weights **are** the masses, so
 the orbits depend on what is being fitted and the gradient runs through every force evaluation of

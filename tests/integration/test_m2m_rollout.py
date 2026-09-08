@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+import optax  # noqa: E402
 import pytest
 
 from mimirax import (
@@ -125,6 +127,60 @@ def _fd_curve(objective, params, direction, steps):
     return ad, {
         h: abs(ad - _directional(objective, params, direction, h)) for h in steps
     }
+
+
+def _log_spaced(key, n, *, rmin=0.3, rmax=4.0, speed=0.3):
+    """Log-spaced radii, so ``|a|`` spans a factor of ~20 and rungs actually split.
+
+    :func:`_plummer_like`'s uniform radii give ``|a|`` a factor-3 spread, and a
+    factor of 3 in acceleration is a factor of 1.7 in
+    ``dt = eta sqrt(eps / |a|)`` -- not enough to straddle a power of two, so
+    every particle lands on the same rung whatever ``k_max`` says. That is how
+    the module's first ``k_max = 1`` tests came to be *vacuous* in the only
+    dimension they were meant to exercise, and it is the same trap jaccpot names
+    for an FMM with no far pairs. This system exists so the multi-rung tests
+    have more than one rung to test.
+    """
+    k_r, k_dir, k_v = jax.random.split(key, 3)
+    u = jax.random.uniform(k_r, (n,))
+    radius = rmin * (rmax / rmin) ** u
+    direction = jax.random.normal(k_dir, (n, 3))
+    direction = direction / jnp.linalg.norm(direction, axis=1, keepdims=True)
+    return radius[:, None] * direction, speed * jax.random.normal(k_v, (n, 3))
+
+
+def _rung_histogram(state) -> dict[int, int]:
+    """Return how many particles sit on each rung, as a plain dict.
+
+    Parameters
+    ----------
+    state : Any
+        A nornax ``BlockStepState``.
+
+    Returns
+    -------
+    dict[int, int]
+        Rung -> count. Asserted non-trivial wherever a test claims to be
+        exercising more than one rung.
+    """
+    rungs = np.asarray(state.rung)
+    values, counts = np.unique(rungs, return_counts=True)
+    return {int(v): int(c) for v, c in zip(values, counts)}
+
+
+def _forward_mode_directional(objective, params, direction):
+    """Directional derivative by ``jax.jvp``: forward mode, an independent path.
+
+    Reverse mode and forward mode share the primal computation and nothing else
+    -- different transformation rules, different traced graph, no reuse of the
+    VJP machinery. Agreement between them is therefore a real check on the
+    gradient, and unlike a finite difference it carries no step-size error at
+    all, so it can be asserted at round-off rather than at a measured tolerance.
+    """
+    tangent = jax.tree_util.tree_map(jnp.zeros_like, params)
+    tangent["weights"] = direction
+    _, out = jax.jvp(objective, (params,), (tangent,))
+    return float(out)
 
 
 # --- item 2: the gradient through the rollout --------------------------------------
@@ -667,3 +723,422 @@ def test_the_bridge_over_an_external_field_fails_conformance_on_momentum() -> No
     assert all(
         "momentum" in name for name in failed
     ), f"only the momentum clause may fail here; got {failed}"
+
+
+# --- how far the autodiff gradient has actually been checked -----------------------
+#
+# The finite-difference curves above are one oracle, and a finite difference is
+# the weakest one available: it has a step-size error that must be argued about,
+# and on a degenerate problem it probes a single direction. The three tests below
+# are the stronger checks, and they exist because the classic
+# `force_of_change` iteration is *not* one -- it calls `jax.grad` on the same
+# objective `minimize` does, so it validates the iteration and its fixed point
+# and shares every possible error in the gradient itself.
+
+
+def test_the_tracer_gradient_matches_a_closed_form_with_no_autodiff(key) -> None:
+    """The tracer objective's gradient in closed form, against autodiff.
+
+    With the orbits independent of the weights the whole objective is available
+    on paper. Writing ``Kbar`` for the time-averaged kernel and ``w0 = 1``:
+
+        F(w)      = 0.5 |(Kbar^T w - Y) / sigma|^2  -  mu S(w)
+        dF/dw     = Kbar (Kbar^T w - Y) / sigma^2   +  mu log(w)
+
+    using ``dS/dw = -log(w / w0)``. **No autodiff appears anywhere in that
+    reference** -- not even for the entropy term -- so this is a genuinely
+    independent oracle for the gradient through a real 12-base-step rollout,
+    and unlike a finite difference it has no step-size error to argue about.
+
+    Measured: ``|AD - closed form| / |closed form| = 6.5e-16`` on a gradient of
+    norm 7.68e+03, worst component 1.6e-12 absolute. That is round-off, and it
+    covers the whole chain -- the rollout's records, the weights broadcast along
+    the time axis, the time average, the kernel contraction, the likelihood and
+    the prior.
+    """
+    problem, _, start = _tracer_problem(key, n=32, num_steps=12)
+    params = {**start, "weights": start["weights"] * 1.3}
+    kernel = GaussianRadialBins(
+        centres=jnp.asarray([0.4, 0.8, 1.2, 1.6, 2.0]), width=0.3
+    )
+
+    trajectory = problem.forward(params)
+    steps = trajectory["positions"].shape[0]
+    averaged_kernel = jnp.mean(
+        jnp.stack(
+            [
+                kernel({leaf: value[t] for leaf, value in trajectory.items()})
+                for t in range(steps)
+            ]
+        ),
+        axis=0,
+    )
+    residual = averaged_kernel.T @ params["weights"] - problem.observed
+    closed_form = averaged_kernel @ (residual / SIGMA**2) + MU * jnp.log(
+        params["weights"]
+    )
+
+    by_autodiff = jax.grad(problem.negative_log_posterior)(params)["weights"]
+    relative = float(
+        jnp.linalg.norm(by_autodiff - closed_form) / jnp.linalg.norm(closed_form)
+    )
+    assert relative < 1.0e-13, f"AD vs closed form: {relative:.3e}"
+
+
+def test_forward_and_reverse_mode_agree_through_the_rollout(key) -> None:
+    """``jax.jvp`` against ``jax.grad``: two independent autodiff transformations.
+
+    A stronger check than a finite difference where it applies, because it has
+    no truncation error -- any disagreement is a bug in one of the two paths,
+    not a step size. Measured: 4.1e-16 relative in the tracer construction,
+    4.4e-16 in the self-consistent one, and 2.6e-16 on the production
+    (``reassign_rungs=True``) path, which no finite difference can check at all
+    because its schedule is not a smooth function of the weights.
+    """
+    k_problem, k_direction = jax.random.split(key)
+    problem, _, start = _tracer_problem(k_problem, n=32, num_steps=12)
+    n = start["weights"].size
+    params = {**start, "weights": start["weights"] * 1.3}
+    direction = jax.random.normal(k_direction, (n,))
+    direction = direction / jnp.linalg.norm(direction)
+
+    objective = problem.negative_log_posterior
+    reverse = float(jnp.sum(jax.grad(objective)(params)["weights"] * direction))
+    forward = _forward_mode_directional(objective, params, direction)
+    assert abs(reverse - forward) <= 1.0e-13 * abs(reverse)
+
+    # And on the self-consistent construction, where the weights move the orbits.
+    k_system, k_weights, k_dir = jax.random.split(key, 3)
+    m = 16
+    positions, velocities = _plummer_like(k_system, m)
+    weights = 0.5 + jax.random.uniform(k_weights, (m,))
+    rollout = NornaxRollout.self_consistent(
+        MutualDirectSumGravity(G=1.0, softening=SOFTENING, k_max=1),
+        dt=0.02,
+        num_steps=12,
+        k_max=1,
+        reassign_rungs=False,
+    )
+    observable = TimeAverage(
+        WeightedKernelSum(
+            GaussianRadialBins(centres=jnp.asarray([0.5, 1.0, 1.5]), width=0.4)
+        )
+    )
+    consistent = {
+        "positions": positions,
+        "velocities": velocities,
+        "weights": weights,
+    }
+    problem = InferenceProblem(
+        forward=rollout,
+        observable=observable,
+        likelihood=GaussianLikelihood(sigma=SIGMA),
+        observed=observable(rollout(consistent)) + 0.05,
+        priors=(EntropyPrior(mu=MU),),
+    )
+    objective = problem.negative_log_posterior
+    direction = jax.random.normal(k_dir, (m,))
+    direction = direction / jnp.linalg.norm(direction)
+    reverse = float(jnp.sum(jax.grad(objective)(consistent)["weights"] * direction))
+    forward = _forward_mode_directional(objective, consistent, direction)
+    assert abs(reverse - forward) <= 1.0e-13 * abs(reverse)
+
+
+# --- the multi-rung path, which the k_max=1 tests above do NOT exercise ------------
+
+
+def _multi_rung_problem(key, *, dt, reassign_rungs, **kwargs):
+    """Build a genuinely multi-rung self-consistent problem and its pieces.
+
+    ``dt`` is a parameter because it decides the *schedule*, and the schedule is
+    what these tests are about: at ``dt = 0.1`` the frozen and production
+    schedules nearly coincide, and at ``dt = 0.05`` they do not.
+    """
+    k_system, k_weights = jax.random.split(key)
+    n = 16
+    positions, velocities = _log_spaced(k_system, n, rmax=4.0)
+    weights = 0.5 + jax.random.uniform(k_weights, (n,))
+    force = MutualDirectSumGravity(G=1.0, softening=SOFTENING, k_max=2)
+    rollout = NornaxRollout.self_consistent(
+        force,
+        dt=dt,
+        num_steps=8,
+        k_max=2,
+        eta=0.1,
+        eps=1.0,
+        reassign_rungs=reassign_rungs,
+        **kwargs,
+    )
+    observable = TimeAverage(
+        WeightedKernelSum(
+            GaussianRadialBins(centres=jnp.asarray([0.5, 1.0, 2.0, 3.0]), width=0.4)
+        )
+    )
+    params = {
+        "positions": positions,
+        "velocities": velocities,
+        "weights": weights,
+    }
+    return rollout, observable, params
+
+
+def _objective_for(rollout, observable, observed):
+    """The made-to-measure objective for one rollout and one data vector."""
+    return InferenceProblem(
+        forward=rollout,
+        observable=observable,
+        likelihood=GaussianLikelihood(sigma=SIGMA),
+        observed=observed,
+        priors=(EntropyPrior(mu=MU),),
+    ).negative_log_posterior
+
+
+def test_the_multi_rung_gradient_is_right_and_the_schedule_is_not_vacuous(
+    key,
+) -> None:
+    """A three-rung rollout: FD, forward mode, and the rung histogram asserted.
+
+    The ``k_max = 1`` tests earlier in this file pass, and until this test was
+    written they were **vacuous** in exactly the dimension they were meant to
+    cover: with :func:`_plummer_like`'s narrow acceleration spread every
+    particle lands on rung 0, so ``k_max = 1`` silently runs the single-rung
+    reduced case and the block schedule is never exercised. The histogram is
+    asserted here for the same reason jaccpot asserts ``num_far_pairs > 0``
+    before believing an FMM number.
+
+    On the log-spaced system the schedule is ``{0: 7, 1: 6, 2: 3}`` -- all three
+    levels evaluated, real sub-step structure. Measured there, frozen schedule,
+    AD = 7.412948423875e+01::
+
+        h     1e-2     1e-3     1e-4     1e-5     1e-6     1e-7     1e-8
+        rel   1.06e-4  1.06e-6  1.06e-8  8.95e-11 8.17e-10 4.30e-9  1.33e-7
+
+    The same clean ``O(h^2)`` truncation branch and round-off floor as the
+    single-rung case, minimum 9.0e-11 relative at h = 1e-5. Forward mode agrees
+    with reverse mode to **5.8e-16**, and that is the assertion that really pins
+    the multi-rung arithmetic: it has no step-size error to trade against.
+    """
+    rollout, observable, params = _multi_rung_problem(
+        key, dt=0.05, reassign_rungs=False
+    )
+    histogram = _rung_histogram(rollout.final_state(params))
+    assert len(histogram) == 3, f"the rung schedule is vacuous: {histogram}"
+    assert histogram == {0: 7, 1: 6, 2: 3}
+
+    objective = _objective_for(rollout, observable, observable(rollout(params)) + 0.05)
+    n = params["weights"].size
+    direction = jax.random.normal(jax.random.fold_in(key, 3), (n,))
+    direction = direction / jnp.linalg.norm(direction)
+
+    ad, curve = _fd_curve(objective, params, direction, (1.0e-5,))
+    assert curve[1.0e-5] <= 1.0e-9 * abs(ad), f"|AD - FD| = {curve[1.0e-5]:.3e}"
+    forward = _forward_mode_directional(objective, params, direction)
+    assert abs(ad - forward) <= 1.0e-13 * abs(ad)
+
+
+@pytest.mark.parametrize(
+    ("label", "knobs", "bound"),
+    [
+        ("checkpoint=False", {"checkpoint": False}, 0.0),
+        (
+            "checkpoint_substeps=True",
+            {"checkpoint": True, "checkpoint_substeps": True},
+            1.0e-13,
+        ),
+    ],
+)
+def test_rematerialization_does_not_move_the_multi_rung_gradient(
+    key, label, knobs, bound
+) -> None:
+    """`checkpoint` and `checkpoint_substeps` are memory schedules, not results.
+
+    Measured on the three-rung system, relative to the default gradient:
+    ``checkpoint=False`` is **exactly zero** -- bit-identical, which is what
+    rematerializing the same arithmetic should give -- and
+    ``checkpoint_substeps=True`` is **8.8e-15**, round-off rather than zero,
+    because remating a sub-step boundary's kick changes the order the pair
+    contributions are summed in. Worth stating precisely rather than rounding to
+    "unchanged": one of these two knobs is exact and the other is exact to
+    round-off, and a future change that made either worse should fail here.
+
+    ``checkpoint_substeps`` is exposed on the adapter because of what nornax's
+    rollout says about it -- it bounds the per-base-step backward memory to one
+    boundary's pair tensors, and deep-``k_max`` gradients otherwise run out of
+    memory. That is precisely the regime a made-to-measure fit at FMM scale
+    lands in, so leaving it reachable only by bypassing the adapter would have
+    meant the adapter could not express the fit the module exists for.
+    """
+    rollout, observable, params = _multi_rung_problem(key, dt=0.1, reassign_rungs=False)
+    observed = observable(rollout(params)) + 0.05
+    baseline = jax.grad(_objective_for(rollout, observable, observed))(params)[
+        "weights"
+    ]
+    variant, _, _ = _multi_rung_problem(key, dt=0.1, reassign_rungs=False, **knobs)
+    got = jax.grad(_objective_for(variant, observable, observed))(params)["weights"]
+    relative = float(jnp.linalg.norm(got - baseline) / jnp.linalg.norm(baseline))
+    assert relative <= bound, f"{label} moved the gradient by {relative:.3e}"
+
+
+@pytest.mark.parametrize(
+    ("dt", "frozen_schedule", "live_schedule", "lo", "hi"),
+    [
+        (0.1, {1: 7, 2: 9}, {1: 4, 2: 12}, 1.0e-3, 0.5),
+        (0.05, {0: 7, 1: 6, 2: 3}, {0: 7, 1: 2, 2: 7}, 0.3, 1.5),
+    ],
+)
+def test_the_production_gradient_tracks_the_schedule_it_realised(
+    key, dt, frozen_schedule, live_schedule, lo, hi
+) -> None:
+    """`reassign_rungs=True` is a different map, and how different is not bounded.
+
+    Every finite-difference test in this file freezes the schedule, because a
+    finite difference of the production path compares two rollouts that may have
+    realised *different* schedules. That leaves the production default -- what a
+    real fit runs -- unmeasured, and this test measures it.
+
+    The answer is not a number, it is a dependence. The production gradient
+    differs from the frozen-schedule one by however much the two **schedules**
+    differ, and that is set by the configuration:
+
+    ======  =========================  =======================  =========  ======
+    ``dt``  frozen schedule            production schedule      relative   cosine
+    ======  =========================  =======================  =========  ======
+    0.1     ``{1: 7, 2: 9}``           ``{1: 4, 2: 12}``        7.2e-02    0.998
+    0.05    ``{0: 7, 1: 6, 2: 3}``     ``{0: 7, 1: 2, 2: 7}``   **0.65**   0.953
+    ======  =========================  =======================  =========  ======
+
+    Three particles move rung between the two ``dt = 0.05`` schedules and the
+    gradient changes by **65 %** in norm; four move at ``dt = 0.1`` and it
+    changes by 7 %. The size of the effect is set by the schedule difference and
+    by nothing a caller can read off in advance. On other configurations tried
+    while writing this test the two gradients came out **nearly antiparallel**
+    (cosine -0.987), so 65 % is not a ceiling.
+
+    Neither gradient is wrong. nornax severs the rung assignment from the
+    gradient, so each is the exact gradient of the map its own forward pass
+    realised -- which this test also asserts, forward against reverse mode at
+    round-off on the production path, where no finite difference can check
+    anything. What the table means is that the production objective is only
+    *piecewise* smooth in the weights: a weight change that moves a particle
+    across a rung boundary lands on a neighbouring map with a kink between. So a
+    finite-difference check on a frozen schedule does **not** license the
+    production path, and a fit that must descend one smooth objective should
+    freeze the schedule. That caveat is now on the adapter, where a caller will
+    see it.
+    """
+    frozen_rollout, observable, params = _multi_rung_problem(
+        key, dt=dt, reassign_rungs=False
+    )
+    live_rollout, _, _ = _multi_rung_problem(key, dt=dt, reassign_rungs=True)
+    assert _rung_histogram(frozen_rollout.final_state(params)) == frozen_schedule
+    assert _rung_histogram(live_rollout.final_state(params)) == live_schedule
+
+    observed = observable(frozen_rollout(params)) + 0.05
+    frozen = jax.grad(_objective_for(frozen_rollout, observable, observed))(params)[
+        "weights"
+    ]
+    live_objective = _objective_for(live_rollout, observable, observed)
+    live = jax.grad(live_objective)(params)["weights"]
+
+    relative = float(jnp.linalg.norm(live - frozen) / jnp.linalg.norm(frozen))
+    assert lo <= relative <= hi, f"relative difference {relative:.3e}"
+
+    # The production gradient is still an exact gradient -- of its own map.
+    n = params["weights"].size
+    direction = jax.random.normal(jax.random.fold_in(key, 7), (n,))
+    direction = direction / jnp.linalg.norm(direction)
+    reverse = float(jnp.sum(live * direction))
+    forward = _forward_mode_directional(live_objective, params, direction)
+    assert abs(reverse - forward) <= 1.0e-13 * abs(reverse)
+
+
+# --- which optimizer, measured on the real problem --------------------------------
+
+
+def test_no_optimizer_wins_on_both_constructions(key) -> None:
+    """The measured answer to "which rule should a made-to-measure fit use".
+
+    There is no default worth hard-coding, and this test is the evidence.
+    Measured on the 64-weight tracer problem, 10000 steps unless stated
+    (``|dF/dw|`` at the end point; the start is 1.32e+04):
+
+    ==============================  =========  ========  ======
+    rule                            ``|g|``    ``chi2``  weight error
+    ==============================  =========  ========  ======
+    ``adam(0.02)``                  7.1e-04    5.4e-11   0.284
+    ``adam(0.1)``                   1.0e-02    1.2e-08   **2.409**
+    ``adam(exponential_decay)``     2.7e-04    3.8e-11   0.254
+    ``adam(0.05, eps=1e-4)``        4.0e-03    8.5e-10   0.720
+    ``sgd(1e-6)``                   **5.6e-05**  6.5e-11   0.246
+    ``lbfgs()``, **50** steps       6.8e-04    8.5e-10   0.246
+    ==============================  =========  ========  ======
+
+    Three things in that table are worth keeping. **Adam is fragile here**: at
+    ``lr = 0.1`` it drives chi-squared to 1.2e-08 and lands 241 % away from the
+    weights that made the data, and ``lr = 0.2`` is worse still. **Plain SGD
+    wins on gradient norm** by an order of magnitude, because the tracer
+    objective is quadratic in the weights and Adam's per-coordinate
+    normalization fights a curvature spread of 2.6e+07 that plain descent simply
+    follows. **LBFGS reaches a lower objective in fifty steps than Adam does in
+    ten thousand.** Tuning Adam's ``eps`` up to 1e-4 rescues ``lr = 0.05`` from
+    divergence, which is the standard stiff-problem fix and worth knowing.
+
+    None of it transfers. On the self-consistent problem (N = 32, ``k_max = 1``,
+    start ``|g| = 5.1e+05``) ``sgd(1e-6)`` **diverges to non-finite weights**,
+    ``adam(0.005)`` reaches ``|g| = 5.6e-04``, and ``lbfgs`` x100 reaches the
+    lowest weight error (0.0779 against Adam's 0.0859) at a much worse gradient
+    norm (0.63). So the rule that is best on one construction fails on the
+    other, which is why :class:`~mimirax.inference.MadeToMeasure` requires an
+    ``optimizer`` rather than choosing one.
+
+    And the sharpest point, which is about the problem and not the optimizer:
+    every row above reaches a chi-squared far below the noise, and the weight
+    errors span **0.246 to 2.409**. On a degenerate problem the optimizer
+    decides *where in the flat valley you stop*, and the residual cannot tell
+    you which point you got. Reading a made-to-measure fit off chi-squared alone
+    is therefore not safe, whatever the optimizer.
+
+    Asserted here: the two rules that behave well on this problem reach a
+    materially lower objective than the Adam default, and the badly scaled Adam
+    run lands far from the truth while still fitting the data. Both are claims
+    about the problem, so both are cheap to keep true.
+    """
+    problem, truth, start = _tracer_problem(key, n=64, num_steps=24)
+    objective = problem.negative_log_posterior
+
+    def error(result):
+        return float(
+            jnp.linalg.norm(result.params["weights"] - truth) / jnp.linalg.norm(truth)
+        )
+
+    adam_default = made_to_measure(0.02, 3000).minimize(objective, start)
+    lbfgs = MadeToMeasure(optimizer=optax.lbfgs(), num_steps=50).minimize(
+        objective, start
+    )
+    plain = MadeToMeasure(optimizer=optax.sgd(1.0e-6), num_steps=3000).minimize(
+        objective, start
+    )
+    badly_scaled = made_to_measure(0.1, 3000).minimize(objective, start)
+
+    for label, result in (
+        ("lbfgs", lbfgs),
+        ("sgd", plain),
+        ("adam", adam_default),
+        ("adam(0.1)", badly_scaled),
+    ):
+        assert jnp.all(jnp.isfinite(result.params["weights"])), label
+        assert jnp.all(result.params["weights"] > 0.0), label
+
+    # LBFGS in 50 steps beats Adam in 3000 on the objective it is minimizing.
+    assert float(lbfgs.objective_trace[-1]) < float(adam_default.objective_trace[-1])
+    assert float(plain.objective_trace[-1]) < float(adam_default.objective_trace[-1])
+
+    # And the optimizer decides where in the valley the fit stops.
+    assert error(badly_scaled) > 4.0 * error(
+        lbfgs
+    ), f"badly scaled Adam {error(badly_scaled):.3f} vs lbfgs {error(lbfgs):.3f}"
+    # chi-squared 1.5e-06 at 3000 steps, from a start of 8.82e+03: nine orders
+    # down, and still 241 % wrong about the weights. That is the whole point.
+    assert (
+        -2.0 * float(problem.log_likelihood(badly_scaled.params)) < 1.0e-4
+    ), "the badly scaled run must still fit the data -- that is the whole point"

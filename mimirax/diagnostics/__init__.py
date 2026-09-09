@@ -9,6 +9,7 @@ from mimirax.diagnostics.degeneracy import (
     degenerate_directions,
     effective_parameters,
     fisher_information,
+    l_curve_corner,
     profile_likelihood,
 )
 from mimirax.diagnostics.residuals import normalized_residuals, residuals, rms_residual
@@ -18,6 +19,7 @@ __all__ = [
     "effective_parameters",
     "fisher_information",
     "has_converged",
+    "l_curve_corner",
     "normalized_residuals",
     "profile_likelihood",
     "relative_change",

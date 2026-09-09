@@ -40,13 +40,14 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+import jax
 import jax.numpy as jnp
 from jax import Array
 
 from mimirax._typing import PerParticle, PyTree, Vec3
-from mimirax.protocols import ForceModel
+from mimirax.protocols import FoldableObservable, ForceModel
 
-__all__ = ["NornaxRollout", "SingleRungMutualForce"]
+__all__ = ["FoldedRollout", "NornaxRollout", "SingleRungMutualForce"]
 
 
 def _leapfrog() -> tuple[Any, Any]:
@@ -253,8 +254,37 @@ class NornaxRollout:
         frozen for the whole rollout. Freeze them to make the map globally
         smooth in the continuous state, which is what a finite-difference
         gradient check needs.
+
+        **This is not a free choice, and the difference is measured.** With it
+        on, the rollout integrates a schedule that depends on the weights
+        through the acceleration, and nornax severs that dependence with
+        ``stop_gradient``. The gradient is therefore exact for the schedule the
+        forward pass *realised* -- reverse and forward mode agree on it to
+        2.6e-16 -- but the objective is only piecewise smooth in the weights: a
+        weight change large enough to move a particle across a rung boundary
+        lands on a different map, with a kink between. On a 16-body,
+        three-rung test system the production gradient differs from the
+        frozen-schedule one by 65 % in norm (cosine 0.953), because the two
+        realise different schedules. Neither is wrong; they are gradients of
+        different maps. Freeze the schedule when a fit must descend one smooth
+        objective, and expect the kinks when it must not.
     checkpoint : bool
-        Whether to wrap each base step in ``jax.checkpoint``.
+        Whether to wrap each base step in ``jax.checkpoint``, bounding the
+        retained backward-pass state to the base-step boundaries. Leave it on:
+        it does not change the gradient (measured bit-identical, single- and
+        multi-rung) and it is what keeps a long rollout's memory linear in
+        ``num_steps``.
+    checkpoint_substeps : bool
+        Whether to additionally remat each sub-step boundary's kick.
+        :attr:`checkpoint` bounds memory *across* base steps but still
+        materializes all ``2**k_max`` sub-step pair tensors while
+        differentiating one base step; this bounds that to one boundary's
+        worth. nornax's rollout documents it as needed for deep ``k_max``
+        gradients, which otherwise run out of memory -- so it is the knob a
+        made-to-measure fit at FMM scale and large ``k_max`` will need, and it
+        is exposed here rather than left reachable only by bypassing the
+        adapter. Off by default, as in nornax; it changes the memory schedule,
+        not the result.
     record : Callable[[Any], PyTree] | None
         nornax's ``record_fn``, which must return a *mapping* so that
         :meth:`__call__` can add the ``"weights"`` leaf beside it; ``None``
@@ -285,6 +315,7 @@ class NornaxRollout:
     eps: float = 1.0
     reassign_rungs: bool = True
     checkpoint: bool = True
+    checkpoint_substeps: bool = False
     record: Callable[[Any], PyTree] | None = None
     rebuild_fn: Callable[..., Any] | None = None
     rebuild_every: int = 1
@@ -318,8 +349,15 @@ class NornaxRollout:
         The case the differentiable N-body stack was built for. Because the
         weights are the masses, the orbits themselves depend on the weights, so
         ``d(objective)/d(weights)`` flows through the force evaluations and
-        through every step of the integration -- which is the part no classic
-        made-to-measure code computes. ``force`` must be a real nornax
+        through every step of the integration.
+
+        That orbit-response term is not unprecedented -- Bovy, Kawata & Hunt
+        (2018, arXiv:1704.03884) compute it for *external-potential* parameters
+        by finite differencing the orbit integration, one extra integration per
+        parameter -- but they explicitly exclude self-gravity, and finite
+        differencing costs ``n + 1`` rollouts when the parameters are the ``n``
+        particle masses. Reverse mode costs one, whatever ``n`` is, which is what
+        makes this construction tractable rather than merely expressible. ``force`` must be a real nornax
         ``MutualForceModel``; a mimirax ``ForceModel`` is rejected above
         ``k_max = 0``.
 
@@ -477,6 +515,7 @@ class NornaxRollout:
             eta=self.eta,
             eps=self.eps,
             checkpoint=self.checkpoint,
+            checkpoint_substeps=self.checkpoint_substeps,
             reassign_rungs=self.reassign_rungs,
             rebuild_fn=self.rebuild_fn,
             rebuild_every=self.rebuild_every,
@@ -498,6 +537,28 @@ class NornaxRollout:
             nornax's ``BlockStepState`` at the end of the rollout.
         """
         return self.rollout(params)[0]
+
+    def folding(
+        self, observable: FoldableObservable, *, segments: int = 1
+    ) -> FoldedRollout:
+        """Return a :class:`ForwardModel` that folds ``observable`` into the rollout.
+
+        The memory escape hatch. See :class:`FoldedRollout`.
+
+        Parameters
+        ----------
+        observable : FoldableObservable
+            The reduction to accumulate; :class:`mimirax.observables.TimeAverage`
+            is one.
+        segments : int
+            How many checkpointed segments to split the rollout into.
+
+        Returns
+        -------
+        FoldedRollout
+            Parameters in, the reduced observable out.
+        """
+        return FoldedRollout(rollout=self, observable=observable, segments=segments)
 
     def __call__(self, params: PyTree) -> PyTree:
         """Integrate and return the recorded trajectory, weights included.
@@ -521,3 +582,218 @@ class NornaxRollout:
             weights, (self.num_steps, *weights.shape)
         )
         return trajectory
+
+
+@dataclass(frozen=True)
+class FoldedRollout:
+    """A rollout with the observable folded in, in checkpointed segments.
+
+    ``params`` in, the **reduced observable** out -- so this is a
+    :class:`~mimirax.protocols.ForwardModel` whose output is already in data
+    space, and the :class:`~mimirax.inference.InferenceProblem` above it takes
+    :class:`~mimirax.observables.IdentityObservable`.
+
+    WHAT IT BUYS, MEASURED. Two things cost ``O(t * n)`` in a made-to-measure
+    fit, and only one of them is autodiff's fault:
+
+    * :class:`NornaxRollout` **stacks the trajectory** -- positions and
+      velocities at every base step -- because a plain
+      :class:`~mimirax.protocols.Observable` needs the whole thing at once. That
+      is ``6 t n`` doubles in the *forward* pass. Folding removes it: the
+      per-step record becomes the ``(m,)`` observable value instead of the
+      ``(n, 3)`` state.
+    * ``lax.scan`` retains one state per step for the **backward** pass. Running
+      the rollout as ``segments`` chained sub-rollouts, each wrapped in
+      :func:`jax.checkpoint`, trades that for ``O(t / segments + segments)``
+      states and one extra forward pass per segment.
+
+    Peak scratch for one gradient, from XLA's own ``memory_analysis``, at
+    ``n = 64``::
+
+        t      segments=1 (NornaxRollout)   segments=sqrt(t)   reduction
+        64     1.4 MB                       0.9 MB             1.6x
+        256    5.6 MB                       1.0 MB             5.6x
+        1024   22.4 MB                      1.2 MB             18x
+
+    The ``segments = 1`` column is linear in ``t``; the ``sqrt(t)`` column is
+    flat. ``segments = sqrt(num_steps)`` is the optimum of
+    ``t / segments + segments`` and is what :meth:`balanced` returns.
+
+    **This is a memory schedule, not an approximation.** The prediction matches
+    the stacked path to 1.2e-16 and its gradient to 5.9e-15, which is what the
+    fold law of :class:`~mimirax.protocols.FoldableObservable` guarantees and
+    what a test measures.
+
+    WHAT IT COSTS. The forward model now knows about the observable, which is
+    exactly the seam :mod:`mimirax.protocols` otherwise keeps apart. That is why
+    this is a separate, explicitly-named class rather than a flag on
+    :class:`NornaxRollout`: the trade is visible at the call site, and a caller
+    who does not need the memory keeps the seam. The licence for chaining
+    segments at all is nornax's ``shooting_node``, which recomputes ``acc`` and
+    ``rung`` at each seam so that ``segments`` sub-rollouts are one trajectory of
+    the same map -- a property this package tests directly.
+
+    Attributes
+    ----------
+    rollout : NornaxRollout
+        The integration to run. Its ``record`` attribute is **ignored**: this
+        class installs its own record function, which returns the observable's
+        per-step value.
+    observable : FoldableObservable
+        The reduction to fold in.
+    segments : int
+        How many checkpointed segments. ``1`` folds the observable but keeps one
+        scan, which already removes the stacked trajectory.
+
+    Raises
+    ------
+    ValueError
+        If ``segments`` is not positive or does not divide
+        ``rollout.num_steps``. An uneven split would weight the segments
+        unequally in an exponential average, so it is refused rather than
+        silently rounded.
+    """
+
+    rollout: NornaxRollout
+    observable: FoldableObservable
+    segments: int = 1
+
+    def __post_init__(self) -> None:
+        """Reject a segment count that would split the rollout unevenly.
+
+        Raises
+        ------
+        ValueError
+            If ``segments`` is not positive or does not divide the step count.
+        """
+        if self.segments < 1:
+            raise ValueError(f"segments must be >= 1; got {self.segments}")
+        if self.rollout.num_steps % self.segments:
+            raise ValueError(
+                f"segments={self.segments} does not divide "
+                f"num_steps={self.rollout.num_steps}; an uneven split would "
+                "weight the segments unequally under a decaying average"
+            )
+
+    @classmethod
+    def balanced(
+        cls, rollout: NornaxRollout, observable: FoldableObservable
+    ) -> FoldedRollout:
+        """Build one with the memory-optimal segment count near ``sqrt(num_steps)``.
+
+        Peak storage goes as ``num_steps / segments + segments``, minimized at
+        ``sqrt(num_steps)``. The largest divisor of ``num_steps`` at or below
+        that is used, since the split has to be even.
+
+        Parameters
+        ----------
+        rollout : NornaxRollout
+            The integration to run.
+        observable : FoldableObservable
+            The reduction to fold in.
+
+        Returns
+        -------
+        FoldedRollout
+            With ``segments`` the best available divisor.
+        """
+        steps = rollout.num_steps
+        target = max(1, int(steps**0.5))
+        segments = next(
+            (k for k in range(target, 0, -1) if steps % k == 0),
+            1,
+        )
+        return cls(rollout=rollout, observable=observable, segments=segments)
+
+    def __call__(self, params: PyTree) -> Array:
+        """Integrate, folding the observable, and return the reduced result.
+
+        Parameters
+        ----------
+        params : PyTree
+            A mapping with ``"positions"`` ``(n, 3)``, ``"velocities"``
+            ``(n, 3)`` and ``"weights"`` ``(n,)``.
+
+        Returns
+        -------
+        Array
+            ``(m,)`` reduced observable -- what
+            :class:`mimirax.observables.TimeAverage` would return from the
+            stacked trajectory, to round-off.
+        """
+        block_kdk_rollout, shooting_node = _leapfrog()
+        base = self.rollout
+        force = base.mutual_force()
+        weights = jnp.asarray(params["weights"])
+        masses = base.dynamical_masses(params)
+        node = shooting_node(
+            jnp.asarray(params["positions"]),
+            jnp.asarray(params["velocities"]),
+            masses,
+            force,
+            k_max=base.k_max,
+            dt_max=base.dt,
+            eta=base.eta,
+            eps=base.eps,
+            base_index=base.base_index,
+            rebuild_fn=base.rebuild_fn,
+        )
+        per_segment = base.num_steps // self.segments
+
+        def record(state: Any) -> Array:
+            """Record the observable's value, not the state: ``(m,)`` not ``(n, 3)``.
+
+            Parameters
+            ----------
+            state : Any
+                A nornax ``BlockStepState`` at a base-step boundary.
+
+            Returns
+            -------
+            Array
+                ``(m,)`` observable value there.
+            """
+            return self.observable.value(
+                {
+                    "positions": state.positions,
+                    "velocities": state.velocities,
+                    "weights": weights,
+                }
+            )
+
+        def segment(carry, _):
+            state, accumulated = carry
+            final, values = block_kdk_rollout(
+                state,
+                base.dt,
+                force,
+                k_max=base.k_max,
+                n_base=per_segment,
+                eta=base.eta,
+                eps=base.eps,
+                checkpoint=base.checkpoint,
+                checkpoint_substeps=base.checkpoint_substeps,
+                reassign_rungs=base.reassign_rungs,
+                rebuild_fn=base.rebuild_fn,
+                rebuild_every=base.rebuild_every,
+                record_fn=record,
+            )
+            accumulated, _ = jax.lax.scan(
+                lambda acc, value: (self.observable.fold(acc, value), None),
+                accumulated,
+                values,
+            )
+            return (final, accumulated), None
+
+        start = self.observable.initial(
+            {
+                "positions": node.positions,
+                "velocities": node.velocities,
+                "weights": weights,
+            }
+        )
+        step = jax.checkpoint(segment) if self.segments > 1 else segment
+        (_, accumulated), _ = jax.lax.scan(
+            step, (node, start), None, length=self.segments
+        )
+        return self.observable.result(accumulated, base.num_steps)

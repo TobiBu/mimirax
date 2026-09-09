@@ -146,11 +146,22 @@ def test_autodiff_reproduces_the_syer_tremaine_bracket(degenerate_problem) -> No
 
     by hand, with ``Delta_j`` the residual of the time-averaged model against
     the data and ``K`` the observable's kernel. Here that expression is written
-    out from the kernel and the residual and compared with the autodiff
-    gradient of ``negative_log_posterior``. They agree to round-off, so the two
-    iterations in :class:`~mimirax.inference.MadeToMeasure` are the classic
-    method's update and not a lookalike -- and no separate hand-coded bracket
-    has to be maintained in the package.
+    out from the kernel and the residual and compared with autodiff.
+
+    **The reference contains no autodiff at all**, which is the point: the
+    entropy term is the closed form ``dS/dw = -log(w / w0)`` rather than
+    ``jax.grad`` of the prior, so nothing in the comparison shares a code path
+    with the quantity under test. An earlier version of this test differentiated
+    the prior, which would have hidden an error in the prior's gradient by
+    making it appear on both sides.
+
+    Why it matters that this test exists at all:
+    :meth:`~mimirax.inference.MadeToMeasure.force_of_change` calls ``jax.grad``
+    on the *same* objective :meth:`~mimirax.inference.MadeToMeasure.minimize`
+    does, so the classic iteration is an oracle for the *iteration and its fixed
+    point* and is **not** an independent check on the gradient. The gradient's
+    oracles are this closed form, the finite-difference curves in
+    ``tests/integration/test_m2m_rollout.py``, and forward-mode autodiff there.
     """
     problem, _, start, kernel, observable = degenerate_problem
     weights = start["weights"] * 1.3
@@ -166,10 +177,10 @@ def test_autodiff_reproduces_the_syer_tremaine_bracket(degenerate_problem) -> No
     )
     averaged_kernel = jnp.mean(per_step, axis=0)  # (n, m)
     chi_term = averaged_kernel @ (residual / SIGMA**2)
-    entropy_term = jax.grad(lambda w: EntropyPrior(mu=MU).log_prob({"weights": w}))(
-        weights
-    )
-    by_hand = chi_term - entropy_term
+    # dS/dw = -log(w / w0) in closed form, w0 = 1. F = chi^2/2 - mu S, so the
+    # prior contributes +mu log(w). No autodiff anywhere in this expression.
+    entropy_term = MU * jnp.log(weights)
+    by_hand = chi_term + entropy_term
 
     by_autodiff = jax.grad(problem.negative_log_posterior)(params)["weights"]
     assert jnp.allclose(by_autodiff, by_hand, rtol=1e-12, atol=1e-12)
@@ -247,29 +258,65 @@ def test_minimize_stays_positive_and_lowers_the_objective(degenerate_problem) ->
     assert set(result.params) == {"weights"}
 
 
-def test_minimize_leaves_non_weight_leaves_in_their_own_space(
-    degenerate_problem,
-) -> None:
-    """Only the named leaves are reparameterized; the rest are optimized as they are.
+def test_minimize_moves_the_weights_and_nothing_else(degenerate_problem) -> None:
+    """Made-to-measure fits weights. Every other leaf comes back untouched.
 
-    A made-to-measure fit that also moves the initial conditions must not push
-    positions through a positivity transform, and this is the test that says so:
-    a ``"positions"`` leaf starting at zero would be ``-inf`` in log space and
-    the fit would return ``nan`` if it were transformed.
+    This is a regression test for a real defect. `minimize` used to optimize
+    *every* leaf of ``params``, so a fit handed the ``{"positions",
+    "velocities", "weights"}`` dict a rollout needs silently had **448** free
+    parameters for 64 particles instead of 64 -- against ten observables -- and
+    moved the positions by 17 % and the velocities by 47 % while its docstring
+    said it was recovering weights. Every recovery and convergence number
+    measured before the fix was a number about a different, much larger
+    inference problem.
+
+    Asserted **exactly zero** movement, not a tolerance: a frozen leaf never
+    enters the optimizer's state, so there is no update to be small.
     """
     problem, _, start, _, _ = degenerate_problem
-    params = {"weights": start["weights"], "offset": jnp.zeros(2)}
+    params = {
+        "weights": start["weights"],
+        "offset": jnp.asarray([3.0, -1.0]),
+        "label": jnp.zeros(4),
+    }
 
     def objective(p):
         return problem.negative_log_posterior({"weights": p["weights"]}) + jnp.sum(
             p["offset"] ** 2
         )
 
-    result = made_to_measure(learning_rate=0.05, num_steps=50).minimize(
+    result = made_to_measure(0.05, 200).minimize(objective, params)
+    assert jnp.array_equal(result.params["offset"], params["offset"])
+    assert jnp.array_equal(result.params["label"], params["label"])
+    assert not jnp.array_equal(result.params["weights"], params["weights"])
+    assert list(result.params) == list(params)
+
+
+def test_also_fit_opts_into_the_larger_inference_problem(degenerate_problem) -> None:
+    """Fitting more than the weights is legitimate, and has to be asked for.
+
+    Syer & Tremaine's method extends to the initial conditions, and
+    :attr:`~mimirax.inference.MadeToMeasure.also_fit` is how that is spelled. It
+    also checks the reparameterization stays off those leaves: an ``offset``
+    starting at zero would be ``-inf`` in log space, so a fit that returns
+    finite values here is a fit that transformed only the weights.
+    """
+    problem, _, start, _, _ = degenerate_problem
+    params = {"weights": start["weights"], "offset": jnp.zeros(2)}
+
+    def objective(p):
+        return problem.negative_log_posterior({"weights": p["weights"]}) + jnp.sum(
+            (p["offset"] - 2.0) ** 2
+        )
+
+    result = made_to_measure(0.05, 400, also_fit=("offset",)).minimize(
         objective, params
     )
     assert jnp.all(jnp.isfinite(result.params["offset"]))
     assert jnp.all(jnp.isfinite(result.params["weights"]))
+    assert jnp.all(result.params["weights"] > 0.0)
+    # It moved toward 2.0, so the leaf really was free.
+    assert float(jnp.min(result.params["offset"])) > 0.5
 
 
 def test_a_bare_array_of_weights_round_trips_through_both_iterations() -> None:
@@ -420,3 +467,96 @@ def test_the_under_determined_problem_is_reported_as_such(degenerate_problem) ->
     )
     assert chi2 < 1.0e-6, f"chi2 {chi2:.3e}"
     assert 0.1 < error < 0.5, f"weight error {error:.3e}"
+
+
+# --- optimizer choice: schedules, quasi-Newton rules, and two stages ---------------
+#
+# `minimize` takes any optax rule, and that is not a decorative claim: a
+# quasi-Newton or line-search rule needs `update` to be handed the objective's
+# value and the objective itself, which the first version of this module did not
+# do. These tests hold that seam open. Which rule is *best* is measured on the
+# real problems in tests/integration/test_m2m_rollout.py and reported in
+# reports/M2M_module.md, not decided here.
+
+
+def test_a_learning_rate_schedule_is_accepted(well_posed_problem) -> None:
+    """`made_to_measure` takes an optax schedule where a float goes.
+
+    Measured on the degenerate 64-weight tracer problem,
+    ``optax.exponential_decay(0.05, 2000, 0.3)`` reaches ``|dF/dw| = 2.7e-4``
+    against the best constant rate's ``7.1e-4``, so this is a knob worth having
+    reachable rather than a generality for its own sake.
+    """
+    problem, _, start, _, _ = well_posed_problem
+    schedule = optax.cosine_decay_schedule(0.05, 2000)
+    result = made_to_measure(schedule, 2000).minimize(
+        problem.negative_log_posterior, start
+    )
+    assert result.objective_trace.size == 2000
+    assert jnp.all(jnp.isfinite(result.objective_trace))
+    assert float(result.objective_trace[-1]) < float(result.objective_trace[0])
+
+
+def test_lbfgs_runs_through_minimize(well_posed_problem) -> None:
+    """A line-search rule works, which needs more than a gradient in `update`.
+
+    ``optax.lbfgs`` is a ``GradientTransformationExtraArgs``: its ``update``
+    requires ``value``, ``grad`` and ``value_fn``, because a line search
+    evaluates the objective at trial points. Handing it only a gradient raises
+    ``TypeError: ... missing 3 required keyword-only arguments: 'value', 'grad',
+    and 'value_fn'``, which is exactly what this module did before
+    :meth:`~mimirax.inference.MadeToMeasure._descend` existed. Thirty LBFGS
+    steps reach the well-posed problem's optimum here; on the degenerate tracer
+    problem fifty of them reach a lower objective than ten thousand Adam steps.
+    """
+    problem, truth, start, _, _ = well_posed_problem
+    result = MadeToMeasure(optimizer=optax.lbfgs(), num_steps=30).minimize(
+        problem.negative_log_posterior, start
+    )
+    assert jnp.all(jnp.isfinite(result.objective_trace))
+    assert jnp.all(result.params["weights"] > 0.0)
+    error = float(
+        jnp.linalg.norm(result.params["weights"] - truth) / jnp.linalg.norm(truth)
+    )
+    assert error < 1.0e-4, f"weight error {error:.3e}"
+
+
+def test_a_refine_stage_concatenates_its_trace(well_posed_problem) -> None:
+    """Adam then LBFGS: one FitResult, one trace, `num_steps + refine_steps` long.
+
+    The two-stage fit the caller asked for is expressible in one object, and the
+    trace is continuous across the seam so convergence can still be read from
+    the result alone. Note what the *measurements* say about it, in the module's
+    report: on both real test problems the best single-stage fit beats the
+    two-stage one, because Adam's first stage has already chosen a point in the
+    objective's flat valley that the refinement cannot leave. The stage exists
+    so the comparison can be run, not because it wins.
+    """
+    problem, _, start, _, _ = well_posed_problem
+    objective = problem.negative_log_posterior
+    result = made_to_measure(0.02, 500, refine=optax.lbfgs(), refine_steps=20).minimize(
+        objective, start
+    )
+    assert result.objective_trace.size == 520
+    assert jnp.all(jnp.isfinite(result.objective_trace))
+    # The seam is a continuation, not a restart: the refinement's first recorded
+    # value is the objective at the point Adam left off.
+    single = made_to_measure(0.02, 500).minimize(objective, start)
+    assert float(result.objective_trace[500]) == pytest.approx(
+        float(objective(single.params)), rel=1e-10
+    )
+    assert float(result.objective_trace[-1]) <= float(result.objective_trace[499])
+
+
+def test_refine_is_ignored_without_steps(well_posed_problem) -> None:
+    """A refine rule with zero steps changes nothing, so the knob is safe to set."""
+    problem, _, start, _, _ = well_posed_problem
+    objective = problem.negative_log_posterior
+    plain = made_to_measure(0.02, 200).minimize(objective, start)
+    with_zero = made_to_measure(
+        0.02, 200, refine=optax.lbfgs(), refine_steps=0
+    ).minimize(objective, start)
+    assert with_zero.objective_trace.size == plain.objective_trace.size
+    assert jnp.allclose(
+        with_zero.params["weights"], plain.params["weights"], atol=1e-14
+    )

@@ -8,6 +8,7 @@ import pytest
 
 from mimirax import (
     OBSERVABLES,
+    FoldableObservable,
     GaussianRadialBins,
     Observable,
     TimeAverage,
@@ -155,3 +156,74 @@ def test_time_average_gradient_in_the_weights_is_the_averaged_kernel(
     )
     want = jnp.mean(per_step, axis=0).T
     assert jnp.allclose(got, want, atol=1e-14)
+
+
+# --- the FoldableObservable half of TimeAverage ------------------------------------
+#
+# The fold law is the whole contract: accumulating one snapshot at a time must
+# give what averaging a stacked trajectory gives. If it does, a caller can pick
+# the path on memory grounds alone, which is what
+# `mimirax.adapters.nornax.FoldedRollout` does.
+
+
+@pytest.mark.parametrize("decay_steps", [None, 0.5, 2.0, 20.0])
+def test_time_average_satisfies_the_fold_law(trajectory, decay_steps) -> None:
+    """Folding snapshot by snapshot equals averaging the stacked trajectory.
+
+    Checked for the plain mean and for three exponential timescales spanning
+    two orders of magnitude, because the decaying case is the one with a
+    non-trivial recursion: ``state <- exp(-1/decay) * state + value``
+    accumulates ``sum_s a^(t-1-s) value_s``, and :meth:`result` has to divide by
+    ``(1 - a^t)/(1 - a)`` to match :meth:`weights`. Getting that normalization
+    wrong is a silent factor on every fitted weight.
+
+    Measured agreement: 4.5e-17 for the mean and 2.6e-16 at worst for the
+    decaying forms -- round-off, as it must be, since the two paths sum the same
+    terms in a different order.
+    """
+    kernel = GaussianRadialBins(centres=jnp.asarray([0.5, 1.0, 1.5]), width=0.4)
+    observable = TimeAverage(WeightedKernelSum(kernel), decay_steps=decay_steps)
+    assert isinstance(observable, FoldableObservable)
+    assert isinstance(observable, Observable)
+
+    steps = trajectory["positions"].shape[0]
+
+    def snapshot(t):
+        return {leaf: value[t] for leaf, value in trajectory.items()}
+
+    state = observable.initial(snapshot(0))
+    for t in range(steps):
+        state = observable.fold(state, observable.value(snapshot(t)))
+    folded = observable.result(state, steps)
+
+    stacked = observable(trajectory)
+    relative = float(jnp.linalg.norm(folded - stacked) / jnp.linalg.norm(stacked))
+    assert relative < 1.0e-14, f"the fold law is violated by {relative:.3e}"
+
+
+def test_the_zero_accumulator_carries_no_gradient(trajectory) -> None:
+    """`initial` must depend on shapes only, so it uses `jax.eval_shape`.
+
+    An accumulator built by *evaluating* the inner observable would both cost a
+    wasted evaluation and thread a gradient from the template snapshot into the
+    reduction. Asserted by differentiating `initial` with respect to the
+    template's weights and getting exactly zero.
+    """
+    kernel = GaussianRadialBins(centres=jnp.asarray([0.5, 1.0]), width=0.4)
+    observable = TimeAverage(WeightedKernelSum(kernel))
+    first = {leaf: value[0] for leaf, value in trajectory.items()}
+
+    def total(weights):
+        return jnp.sum(observable.initial({**first, "weights": weights}))
+
+    assert float(jnp.max(jnp.abs(jax.grad(total)(first["weights"])))) == 0.0
+    assert float(jnp.max(jnp.abs(observable.initial(first)))) == 0.0
+
+
+def test_value_is_the_inner_observable(trajectory) -> None:
+    """`value` is the per-snapshot observable and nothing else."""
+    kernel = GaussianRadialBins(centres=jnp.asarray([0.7, 1.4]), width=0.5)
+    inner = WeightedKernelSum(kernel)
+    observable = TimeAverage(inner)
+    first = {leaf: value[0] for leaf, value in trajectory.items()}
+    assert jnp.array_equal(observable.value(first), inner(first))

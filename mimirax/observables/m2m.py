@@ -212,6 +212,20 @@ class TimeAverage:
     average to represent a stationary state. That is measured -- vary the number
     of recorded steps and watch the fitted weights -- not assumed.
 
+    **Both averages fold**, so this also satisfies
+    :class:`~mimirax.protocols.FoldableObservable`: a caller can either stack
+    the trajectory and average it (:meth:`__call__`) or accumulate it one
+    snapshot at a time inside the integration (:meth:`value` / :meth:`initial` /
+    :meth:`fold` / :meth:`result`), and the two give the same answer to
+    round-off. The second path costs ``O(m)`` memory where the first costs
+    ``O(t * n)``, which is what
+    :class:`mimirax.adapters.nornax.FoldedRollout` exists to exploit. The mean
+    folds by summing; the exponential average folds through the recursion
+    ``state <- exp(-1 / decay_steps) * state + value``, whose value after ``t``
+    snapshots is ``sum_s a^(t - 1 - s) value_s`` -- exactly the unnormalized
+    weights :meth:`weights` returns -- so :meth:`result` divides by
+    ``(1 - a^t) / (1 - a)``.
+
     Attributes
     ----------
     inner : Callable[[PyTree], Array]
@@ -290,3 +304,81 @@ class TimeAverage:
         per_step = self.step_values(state)
         weights = self.weights(per_step.shape[0]).astype(per_step.dtype)
         return jnp.tensordot(weights, per_step, axes=(0, 0))
+
+    # --- the FoldableObservable half ---------------------------------------------
+
+    def value(self, snapshot: PyTree) -> Array:
+        """Evaluate the inner observable at one snapshot.
+
+        Parameters
+        ----------
+        snapshot : PyTree
+            A single time slice, with no leading time axis.
+
+        Returns
+        -------
+        Array
+            ``(m,)`` inner observable at that snapshot.
+        """
+        return jnp.asarray(self.inner(snapshot))
+
+    def initial(self, snapshot: PyTree) -> Array:
+        """Return the zero accumulator, shaped by tracing the inner observable.
+
+        Uses :func:`jax.eval_shape`, so the inner observable is never evaluated
+        and the accumulator carries no gradient from ``snapshot``.
+
+        Parameters
+        ----------
+        snapshot : PyTree
+            A template time slice.
+
+        Returns
+        -------
+        Array
+            ``(m,)`` zeros of the inner observable's dtype.
+        """
+        shape = jax.eval_shape(self.value, snapshot)
+        return jnp.zeros(shape.shape, dtype=shape.dtype)
+
+    def fold(self, state: Array, value: Array) -> Array:
+        """Accumulate one snapshot's value.
+
+        Parameters
+        ----------
+        state : Array
+            The running accumulator.
+        value : Array
+            ``(m,)`` value at the next snapshot.
+
+        Returns
+        -------
+        Array
+            ``state + value`` for the plain mean; the decayed recursion
+            ``exp(-1 / decay_steps) * state + value`` for exponential smoothing.
+        """
+        if self.decay_steps is None:
+            return state + value
+        return jnp.exp(-1.0 / self.decay_steps) * state + value
+
+    def result(self, state: Array, num_steps: int) -> Array:
+        """Normalize the accumulator into the averaged observable.
+
+        Parameters
+        ----------
+        state : Array
+            The final accumulator.
+        num_steps : int
+            How many snapshots were folded. Static.
+
+        Returns
+        -------
+        Array
+            ``(m,)`` time-averaged observable, equal to :meth:`__call__` on the
+            stacked trajectory.
+        """
+        if self.decay_steps is None:
+            return state / num_steps
+        decay = jnp.exp(-1.0 / self.decay_steps)
+        # sum_{k=0}^{t-1} a^k, the same normalization `weights` applies.
+        return state * (1.0 - decay) / (1.0 - decay**num_steps)

@@ -28,6 +28,7 @@ from mimirax.testing import LinearForwardModel
 def test_methods_registry_names() -> None:
     """The six planned methods are registered under stable names."""
     assert METHODS.available() == (
+        "data_resampling",
         "hmc",
         "made_to_measure",
         "mean_field_vi",

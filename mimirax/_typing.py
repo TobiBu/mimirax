@@ -25,6 +25,7 @@ __all__ = [
     "PyTree",
     "Scalar",
     "ScalarLike",
+    "SigmaLike",
     "Vec3",
 ]
 
@@ -57,3 +58,10 @@ else:
 
 # A scalar accepted at an API boundary: either a 0-d array or a Python float.
 ScalarLike: TypeAlias = Scalar | float
+
+# A noise width: one number for every data point, or one per point. The array
+# form is what a data vector stacking incommensurate moments needs -- see
+# ``mimirax.likelihoods.GaussianLikelihood``. Deliberately not shape-annotated:
+# it broadcasts against the data, so a scalar, an ``(m,)`` vector and an
+# ``(1,)`` array are all valid and jaxtyping would bind ``m`` from it.
+SigmaLike: TypeAlias = Array | float

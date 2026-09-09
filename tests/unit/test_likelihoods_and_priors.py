@@ -170,3 +170,107 @@ def test_entropy_prior_is_nan_outside_its_domain() -> None:
     is this test's job to expose.
     """
     assert bool(jnp.isnan(EntropyPrior().log_prob({"weights": jnp.asarray([-1.0])})))
+
+
+def test_gaussian_likelihood_takes_one_sigma_per_data_point() -> None:
+    """An array ``sigma`` weights each point by its own width.
+
+    Supported and documented rather than merely arithmetically working. A
+    made-to-measure data vector stacks a binned mass moment and a binned
+    ``|v|^2`` moment, whose numerical scales differ by whatever ``|v|^2``
+    happens to be, so a scalar width weights them by accident of units.
+    """
+    p = jnp.asarray([1.0, 2.0, 3.0])
+    o = jnp.asarray([1.5, 2.5, 2.0])
+    sigma = jnp.asarray([0.5, 1.0, 2.0])
+    expected = 1.0 + 0.25 + 0.25
+    assert float(chi_squared(p, o, sigma)) == pytest.approx(expected)
+    like = GaussianLikelihood(sigma=sigma)
+    assert float(like.log_prob(p, o)) == pytest.approx(-0.5 * expected)
+    grad = jax.grad(like.log_prob)(p, o)
+    assert jnp.allclose(grad, -(p - o) / (sigma * sigma), atol=1.0e-14)
+
+
+def test_a_scalar_sigma_is_the_same_as_a_constant_array() -> None:
+    """The two spellings of homoscedastic noise agree exactly."""
+    p = jnp.asarray([1.0, 2.0, 3.0])
+    o = jnp.asarray([1.5, 2.5, 2.0])
+    scalar = GaussianLikelihood(sigma=0.5)
+    array = GaussianLikelihood(sigma=jnp.full((3,), 0.5))
+    assert float(array.log_prob(p, o)) == pytest.approx(float(scalar.log_prob(p, o)))
+
+
+def test_a_per_point_sigma_reweights_incommensurate_moments() -> None:
+    """The defect the array form fixes, shown on a two-moment data vector.
+
+    Two observables measured to the *same fractional* precision, one of scale
+    1 and one of scale 100. A scalar ``sigma`` puts essentially all the weight
+    on the large-scale entry; the per-point form splits it evenly, which is
+    what "both are known to 1 %" means.
+    """
+    observed = jnp.asarray([1.0, 100.0])
+    predicted = jnp.asarray([1.01, 101.0])  # both 1 % high
+    scalar = float(chi_squared(predicted, observed, 1.0))
+    per_point = float(chi_squared(predicted, observed, 0.01 * observed))
+    # Scalar: the second entry contributes (1.0 / 1.0)^2 = 1 against the
+    # first's (0.01)^2 = 1e-4 -- four orders of magnitude of accidental
+    # weighting.
+    assert scalar == pytest.approx(1.0 + 1.0e-4)
+    # Per point: each contributes exactly 1.
+    assert per_point == pytest.approx(2.0)
+
+
+def test_entropy_prior_divergence_is_a_norm_and_minus_s_is_not() -> None:
+    """``divergence`` is zero at the mode and positive off it; ``-S`` is negative.
+
+    This is why :func:`mimirax.l_curve_corner` takes the divergence: an L-curve
+    is drawn in ``log(norm)``, and ``log(-S)`` does not exist at the prior's own
+    mode. The two differ by the constant ``sum(w0)``, so they share a minimiser
+    and have different L-curves.
+    """
+    reference = 0.5
+    prior = EntropyPrior(mu=2.0, reference=reference)
+    at_mode = {"weights": jnp.full((3,), reference)}
+    off_mode = {"weights": jnp.asarray([0.2, 0.8, 0.5])}
+
+    assert float(prior.divergence(at_mode)) == pytest.approx(0.0, abs=1.0e-15)
+    assert float(prior.divergence(off_mode)) > 0.0
+    # -S is negative at the mode, so it is not a norm.
+    assert float(-prior.log_prob(at_mode)) < 0.0
+    # They differ by sum(w0), independently of the weights.
+    for params in (at_mode, off_mode):
+        gap = float(prior.divergence(params)) - float(
+            -prior.log_prob(params) / prior.mu
+        )
+        assert gap == pytest.approx(3 * reference, rel=1.0e-12)
+
+
+def test_entropy_prior_divergence_ignores_mu_and_reads_the_named_leaf() -> None:
+    """``mu`` scales ``log_prob`` and not the divergence, which is the functional."""
+    weights = jnp.asarray([0.3, 1.2, 0.7])
+    params = {"weights": weights, "positions": jnp.zeros((3, 3))}
+    one = EntropyPrior(mu=1.0)
+    thousand = EntropyPrior(mu=1000.0)
+    assert float(one.divergence(params)) == pytest.approx(
+        float(thousand.divergence(params)), rel=1.0e-14
+    )
+    # Read off the named leaf only: the positions never enter a logarithm.
+    assert jnp.isfinite(one.divergence(params))
+    with pytest.raises(KeyError, match="found no such leaf"):
+        EntropyPrior(key="w").divergence({"weights": weights})
+
+
+def test_entropy_prior_divergence_sums_over_leaves_with_no_key() -> None:
+    """``key=None`` applies it to every leaf, the way ``log_prob`` does."""
+    prior = EntropyPrior(reference=1.0, key=None)
+    params = {"a": jnp.asarray([1.0, 1.0]), "b": jnp.asarray([1.0])}
+    assert float(prior.divergence(params)) == pytest.approx(0.0, abs=1.0e-15)
+    moved = {"a": jnp.asarray([0.5, 2.0]), "b": jnp.asarray([1.0])}
+    one_leaf = EntropyPrior(reference=1.0, key=None).divergence(jnp.asarray([0.5, 2.0]))
+    assert float(prior.divergence(moved)) == pytest.approx(float(one_leaf), rel=1e-14)
+
+
+def test_entropy_prior_divergence_is_nan_outside_its_domain() -> None:
+    """Same domain rule as ``log_prob``: positivity is not clipped away here."""
+    prior = EntropyPrior()
+    assert jnp.isnan(prior.divergence({"weights": jnp.asarray([1.0, -0.5])}))

@@ -233,3 +233,68 @@ class EntropyPrior:
                 )
             return self._leaf(params[self.key])
         return _sum_over_leaves(params, self._leaf)
+
+    def _divergence_leaf(self, weights: Array) -> Scalar:
+        """Return the KL divergence of one weight leaf from the reference.
+
+        Parameters
+        ----------
+        weights : Array
+            Strictly positive weights.
+
+        Returns
+        -------
+        Scalar
+            ``sum_i [w_i log(w_i / w0_i) - w_i + w0_i]``, without ``mu``.
+        """
+        w = jnp.asarray(weights)
+        reference = jnp.ones_like(w) if self.reference is None else self.reference
+        return jnp.sum(w * jnp.log(w / reference) - w + reference)
+
+    def divergence(self, params: PyTree) -> Scalar:
+        """Return the prior's **norm**: the KL divergence from the reference.
+
+        ``sum_i [w_i log(w_i / w0_i) - w_i + w0_i]``, which is ``>= 0`` and zero
+        exactly at ``w = w0``. Note ``mu`` does **not** appear: this is the
+        functional ``mu`` weights, not the weighted term.
+
+        WHY THIS EXISTS AND ``-log_prob`` WILL NOT DO.
+        Choosing ``mu`` by an L-curve means plotting the misfit against the
+        regularizer's norm, and ``-log_prob / mu = -S = sum_i w_i (log(w_i/w0_i)
+        - 1)`` is **not a norm**: at the prior's own mode ``w = w0`` it equals
+        ``-sum_i w0_i``, which is negative, and its logarithm -- which is what
+        an L-curve is drawn in -- does not exist. The two differ by the constant
+        ``sum_i w0_i``, so they have the same minimiser and a *different*
+        L-curve. An L-curve drawn against ``-S`` is a curve of the wrong
+        quantity; this is the right one.
+
+        With ``include_linear_term=False`` the log density is a different
+        functional, but this divergence is unchanged -- it is the natural norm
+        for either spelling, and it is what
+        :func:`mimirax.diagnostics.l_curve_corner` expects.
+
+        Parameters
+        ----------
+        params : PyTree
+            The particle weights, read the same way :meth:`log_prob` reads them.
+
+        Returns
+        -------
+        Scalar
+            The KL divergence from the reference. ``nan`` where any weight is
+            non-positive, for the reason :meth:`log_prob` gives.
+
+        Raises
+        ------
+        KeyError
+            If ``params`` is a mapping and :attr:`key` is not one of its keys.
+        """
+        if self.key is not None and isinstance(params, Mapping):
+            if self.key not in params:
+                raise KeyError(
+                    f"EntropyPrior(key={self.key!r}) found no such leaf; params "
+                    f"has {tuple(params)}. Pass key=... or key=None to apply the "
+                    "prior to every leaf."
+                )
+            return self._divergence_leaf(params[self.key])
+        return _sum_over_leaves(params, self._divergence_leaf)

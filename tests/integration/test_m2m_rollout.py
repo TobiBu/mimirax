@@ -1602,9 +1602,19 @@ def test_the_weights_are_recovered_when_the_observables_determine_them(key) -> N
     ===========================  =====  ==============  ==========  ==============
     observable set               ``m``  ``eff`` of 32   ``chi2``    weight error
     ===========================  =====  ==============  ==========  ==============
-    5 radial bins x 2 moments    10     **10.00**       4.2e-14     **0.211**
+    5 radial bins x 2 moments    10     **10.00**       3.7e-15     **0.182**
     LOSVD, 8 radii x 8 speeds    64     **32.00**       1.9e-05     **6.7e-03**
     ===========================  =====  ==============  ==========  ==============
+
+    The radial row was ``4.2e-14`` / ``0.211`` until 2026-10-02, when
+    ``studies/sensitivity_figure.py`` -- which draws this comparison and so had
+    to reproduce it -- measured ``3.7e-15`` / ``0.182`` from this file's own
+    helpers. The assertions below are bounds and passed either way, which is
+    why the drift was not caught here. Only the *under-determined* row moved:
+    with 22 of its 32 directions exactly unconstrained, LBFGS stops somewhere
+    in a 22-dimensional flat subspace and the weight error records where, not
+    how well it did. Treat that number as indicative; the LOSVD row is
+    reproducible and is the one that carries a claim.
 
     Read the rows together. The first reaches a chi-squared 9 orders of
     magnitude smaller and a weight error **31 times larger**: the fit is not

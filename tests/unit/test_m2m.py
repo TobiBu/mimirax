@@ -448,6 +448,26 @@ def test_the_under_determined_problem_is_reported_as_such(degenerate_problem) ->
     build. The claim under test is that the data contribute *nothing* along the
     direction; 1e-6 states that without also asserting LAPACK's last bits.
 
+    WHY THE FIT IS LBFGS AND NOT A FIXED NUMBER OF ADAM STEPS.
+    Until 2026-10-02 this fitted with ``made_to_measure(learning_rate=0.05,
+    num_steps=20000)``, and the chi-squared it asserts was whatever that run
+    happened to be passing through at step 20000. On fourteen *exactly* null
+    directions the objective is flat, so Adam drifts along them and its
+    chi-squared at any particular step is a lottery: measured here at one
+    learning rate, it reads 2.8e-08 at 1000 steps, 1.5e-04 at 2000, 2.7e-08 at
+    20000 and 2.1e+00 at 30000, while the weight error sits at 0.24 throughout.
+    The assertion survived for a year because the draw at step 20000 was a good
+    one on CI's linux build; jax 0.11.2 perturbed the arithmetic, the draw
+    changed, and it failed at chi-squared 2.7e-01 -- on a build where nothing
+    about the problem or the method had changed.
+
+    LBFGS converges and then stays put: 2.520e-08 at 500 steps and the same to
+    four figures at 1000, 2000 and 5000, with the weight error 0.2319. Those are
+    the numbers this docstring quotes, so the test now measures the property it
+    describes -- a vanishing misfit that still leaves the weights 23 % wrong --
+    rather than where a wandering iterate was when the loop ended. The
+    degeneracy that makes the drift inevitable is the subject of the test.
+
     This is the diagnostic the module ships instead of a choice of observables
     that makes the recovery look good.
     """
@@ -458,7 +478,7 @@ def test_the_under_determined_problem_is_reported_as_such(degenerate_problem) ->
     assert directions.shape[1] >= 14
     assert directions.shape[1] == 15
 
-    fit = made_to_measure(learning_rate=0.05, num_steps=20000).minimize(
+    fit = MadeToMeasure(optimizer=optax.lbfgs(), num_steps=1000).minimize(
         problem.negative_log_posterior, start
     )
     chi2 = -2.0 * float(problem.log_likelihood(fit.params))

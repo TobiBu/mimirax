@@ -70,6 +70,11 @@ dev = [
   "build>=1.2.2",
   "twine>=5.1.1",
 ]
+studies = [
+  # studies/ is the only place in this repository that draws anything. The core
+  # package must never import matplotlib, so it lives in its own extra.
+  "matplotlib>=3.8",
+]
 docs = [
   "sphinx>=7.0",
   "furo>=2024.1.29",

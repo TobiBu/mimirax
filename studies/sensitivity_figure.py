@@ -10,9 +10,17 @@ Two figures, one computation:
 
 ``sensitivity_information``
     The spectrum the observables determine, with the prior's threshold drawn
-    across it, beside the consequence: the same 32 orbits recovered under two
-    instruments. The under-determined one reaches a chi-squared nine orders of
-    magnitude smaller and a weight error 31 times larger.
+    across it, beside the consequence: the same 32 orbits recovered under three
+    instruments **of identical size**. All three measure 64 numbers; what they
+    determine ranges from 13.8 to 32.0 of the 32 weights, and the set with the
+    worst chi-squared recovers the weights best.
+
+    WHY ALL THREE HAVE m = 64. ``effective_parameters`` is bounded above by
+    ``min(m, n)``. An earlier version of this figure compared m = 10 against
+    m = 64 and reported ``effective = 10.00`` for the first, which is forced by
+    that bound rather than measured -- a reader is entitled to object that the
+    comparison is arithmetic. Holding m fixed removes the objection: the sets
+    below differ only in what was measured, not in how much.
 ``sensitivity_information_map``
     Which datum carries information about which parameter -- the LOSVD grid,
     and the per-pixel Fisher contribution to two named orbit weights.
@@ -75,6 +83,11 @@ ORBIT_RMIN, ORBIT_RMAX = 0.5, 2.0
 BIN_CENTRES = (0.4, 2.0)
 NUM_BINS = 5
 BIN_WIDTH = 0.3
+# 32 bins x 2 moments = 64 observables, matching the LOSVD grid exactly. At a
+# spacing of 0.05 the wide bins overlap heavily; that redundancy is deliberate
+# and is stated on the figure, because it is the variable under test.
+WIDE_BINS = 32
+WIDE_WIDTH = 0.6
 # The LOSVD grid, copied from the integration test so that the figure and the
 # test describe the same system. Not the same numbers as the orbit radii.
 NUM_RADII, NUM_SPEEDS = 8, 8
@@ -89,12 +102,24 @@ RESULTS = HERE / "results"
 # Okabe-Ito. Distinguishable under every common colour-vision deficiency, and
 # separable in greyscale; the claim is never carried by hue alone -- each
 # observable set also has its own marker and line style.
-BLUE, VERMILLION = "#0072B2", "#D55E00"
+# Okabe-Ito: distinguishable under common colour-vision deficiencies and
+# separable in greyscale. No claim is carried by hue alone -- each set also has
+# its own marker and line style.
+BLUE, VERMILLION, GREEN = "#0072B2", "#D55E00", "#009E73"
 SETS = {
-    "radial": dict(colour=BLUE, marker="o", line="-", name="5 radial bins x 2 moments"),
-    "losvd": dict(
-        colour=VERMILLION, marker="s", line="--", name="LOSVD, 8 radii x 8 speeds"
+    "radial_wide": dict(
+        colour=GREEN,
+        marker="^",
+        line=":",
+        name="32 radial bins x 2 moments, width 0.6",
     ),
+    "radial_narrow": dict(
+        colour=VERMILLION,
+        marker="s",
+        line="--",
+        name="32 radial bins x 2 moments, width 0.3",
+    ),
+    "losvd": dict(colour=BLUE, marker="o", line="-", name="LOSVD, 8 radii x 8 speeds"),
 }
 THEMES = {
     "light": dict(fg="#101010", muted="#505050", bg="#FFFFFF", grid="#C8C8C8"),
@@ -191,9 +216,18 @@ def observable_sets() -> dict[str, Any]:
     dict[str, Any]
         Keyed by set label; each value is a kernel.
     """
+    # All three carry exactly 64 observables. That is the point of the figure:
+    # `effective_parameters` is bounded by min(m, n), so a comparison between
+    # observable sets of different size demonstrates nothing that counting does
+    # not already give. Holding m fixed is what makes the result a measurement.
     return {
-        "radial": GaussianRadialBins(
-            centres=jnp.linspace(*BIN_CENTRES, NUM_BINS),
+        "radial_wide": GaussianRadialBins(
+            centres=jnp.linspace(*BIN_CENTRES, WIDE_BINS),
+            width=WIDE_WIDTH,
+            moments=("mass", "v2"),
+        ),
+        "radial_narrow": GaussianRadialBins(
+            centres=jnp.linspace(*BIN_CENTRES, WIDE_BINS),
             width=BIN_WIDTH,
             moments=("mass", "v2"),
         ),
@@ -380,7 +414,7 @@ def figure_one(record: dict[str, Any], theme_name: str) -> plt.Figure:
     """
     theme = THEMES[theme_name]
     threshold = record["provenance"]["threshold_mu_over_w0"]
-    figure, (left, right) = plt.subplots(1, 2, figsize=(13.5, 5.6))
+    figure, (left, right) = plt.subplots(1, 2, figsize=(14.0, 6.6))
     figure.patch.set_facecolor(theme["bg"])
 
     for label, meta in SETS.items():
@@ -396,22 +430,35 @@ def figure_one(record: dict[str, Any], theme_name: str) -> plt.Figure:
             color=meta["colour"],
             markersize=6,
             linewidth=2.0,
-            label=f"{meta['name']}  (m = {entry['m']})",
+            label=(
+                f"{meta['name']}\n"
+                f"   m = {entry['m']}, {entry['num_above_threshold']} of "
+                f"{NUM_ORBITS} above the cut"
+            ),
         )
 
     # The directions the data do not constrain are **exactly** zero, not small.
     # Drawing them on the log axis would give them a value they do not have, so
     # they are marked at the floor and counted instead.
     floor = 1.0e-9
-    radial = np.asarray(record["sets"]["radial"]["spectrum"])
-    zeros = np.flatnonzero(radial == 0.0) + 1
+    # With m = 64 against n = 32 no set is rank-limited, so there are normally
+    # no exact zeros left to mark. The branch stays because it is the honest
+    # rendering if a future set is rank-deficient: an exactly unconstrained
+    # direction must not be drawn at a small non-zero value on a log axis.
+    zeros = np.array([], dtype=int)
+    for label in SETS:
+        spec = np.asarray(record["sets"][label]["spectrum"])
+        zeros = np.flatnonzero(spec == 0.0) + 1
+        if zeros.size:
+            zero_colour = SETS[label]["colour"]
+            break
     if zeros.size:
         left.plot(
             zeros,
             np.full(zeros.size, floor),
             marker="x",
             linestyle="none",
-            color=SETS["radial"]["colour"],
+            color=zero_colour,
             markersize=7,
             markeredgewidth=1.6,
         )
@@ -421,10 +468,8 @@ def figure_one(record: dict[str, Any], theme_name: str) -> plt.Figure:
             xytext=(float(zeros.mean()), floor * 10**1.5),
             ha="center",
             fontsize=11,
-            color=SETS["radial"]["colour"],
-            arrowprops=dict(
-                arrowstyle="->", color=SETS["radial"]["colour"], linewidth=1.4
-            ),
+            color=zero_colour,
+            arrowprops=dict(arrowstyle="->", color=zero_colour, linewidth=1.4),
         )
 
     left.axhline(threshold, color=theme["fg"], linewidth=1.6, linestyle=":")
@@ -437,34 +482,25 @@ def figure_one(record: dict[str, Any], theme_name: str) -> plt.Figure:
         fontsize=11,
         color=theme["fg"],
     )
-    for label, meta in SETS.items():
-        entry = record["sets"][label]
-        above = entry["num_above_threshold"]
-        left.annotate(
-            f"{above} of {NUM_ORBITS}\nabove the cut",
-            xy=(above, np.asarray(entry["spectrum"])[above - 1]),
-            xytext=(above - 1.5, 10.0 ** (-4.6 if label == "radial" else -2.2)),
-            ha="right",
-            fontsize=11,
-            color=meta["colour"],
-            arrowprops=dict(arrowstyle="->", color=meta["colour"], linewidth=1.4),
-        )
     left.set_ylim(floor / 6.0, 10.0**8)
     left.set_xlim(0, NUM_ORBITS + 1)
     left.set_xlabel("eigenvalue index $k$  (of 32 orbit weights)")
     left.set_ylabel("data-curvature eigenvalue $d_k$")
     left.set_title(
-        "The instrument sets the spectrum.\nThe prior only sets where it is cut.",
+        "Sixty-four numbers each. What they determine differs.",
         fontsize=13.5,
         loc="left",
         color=theme["fg"],
     )
     left.legend(
-        fontsize=10,
-        facecolor="none",
+        fontsize=9,
+        facecolor=theme["bg"],
+        framealpha=0.85,
         edgecolor=theme["muted"],
         labelcolor=theme["fg"],
-        loc="upper right",
+        loc="lower left",
+        borderpad=0.7,
+        labelspacing=0.8,
     )
     left.grid(True, which="major", color=theme["grid"], linewidth=0.6, alpha=0.5)
     _style(left, theme)
@@ -481,10 +517,9 @@ def figure_one(record: dict[str, Any], theme_name: str) -> plt.Figure:
             alpha=0.85,
             linestyle="none",
             label=(
-                f"{meta['name']}\n"
-                f"  effective = {entry['effective']:.2f} of {NUM_ORBITS}"
-                f"   $\\chi^2$ = {entry['chi_squared']:.1e}\n"
-                f"  weight error = {entry['weight_error']:.3f}"
+                f"effective {entry['effective']:5.2f} of {NUM_ORBITS}   "
+                f"$\\chi^2$ {entry['chi_squared']:.1e}   "
+                f"error {entry['weight_error']:.3f}"
             ),
         )
     limits = [float(truth.min()) * 0.75, float(truth.max()) * 1.25]
@@ -494,33 +529,46 @@ def figure_one(record: dict[str, Any], theme_name: str) -> plt.Figure:
     right.set_xlabel("true orbit weight")
     right.set_ylabel("recovered orbit weight")
     right.set_title(
-        "The better fit is the worse answer.\nThe fit is not what fails; the observations are.",
+        "The worst-fitting set recovers the weights best.",
         fontsize=13.5,
         loc="left",
         color=theme["fg"],
     )
     right.legend(
-        fontsize=9.5,
-        facecolor="none",
+        fontsize=9,
+        facecolor=theme["bg"],
+        framealpha=0.85,
         edgecolor=theme["muted"],
         labelcolor=theme["fg"],
-        loc="upper left",
+        loc="lower right",
+        borderpad=0.7,
+        title="all three measure 64 numbers",
+        title_fontsize=9,
     )
+    right.get_legend().get_title().set_color(theme["muted"])
     right.grid(True, color=theme["grid"], linewidth=0.6, alpha=0.5)
     _style(right, theme)
 
-    figure.tight_layout(rect=(0.0, 0.155, 1.0, 1.0))
+    figure.tight_layout(rect=(0.0, 0.225, 1.0, 1.0))
     _caption(
         figure,
         theme,
-        "Mock tracer orbits in a softened point mass -- not a galaxy, not an instrument, not "
+        "All three observable sets contain exactly 64 numbers, against 32 orbit weights. This "
+        "matters: effective_parameters is bounded above by min(m, n), so comparing sets of "
+        "different size would demonstrate only that bound. Holding m fixed, what the data "
+        "determine ranges from 13.8 to 32.0 of the 32 weights according to what was measured.\n"
+        "The radial sets place 32 Gaussian bins over 0.4 to 2.0 at a spacing of 0.05, so bins of "
+        "width 0.3 and 0.6 overlap substantially. That redundancy is deliberate and is the "
+        "variable under test. Note also that effective_parameters separates the under-determined "
+        "from the determined case sharply, but does not finely predict the weight error within "
+        "the under-determined regime, where the prior fills a null space of comparable size "
+        "either way.\n"
+        f"Mock tracer orbits in a softened point mass -- not a galaxy, not an instrument, not "
         f"data. N = {NUM_ORBITS} orbits, softening = {SOFTENING}, {NUM_STEPS} steps of "
         f"dt = {DT}, entropy prior mu = {MU:.0e}, LBFGS for {FIT_STEPS} steps. Eigenvalues are "
         "the squared singular values of the whitened Jacobian, which is exact here and avoids "
-        "the negative eigenvalues eigvalsh returns at this spectrum.\n"
-        "'effective' is effective_parameters, a local Gaussian-limit quantity, not a posterior. "
-        "Both panels show both instruments: cropping either to the LOSVD alone turns the point "
-        "into a capability claim and inverts it.",
+        "the negative eigenvalues eigvalsh returns at this spectrum. effective_parameters is a "
+        "local Gaussian-limit quantity, not a posterior.",
     )
     return figure
 

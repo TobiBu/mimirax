@@ -1592,40 +1592,52 @@ def test_the_weights_are_recovered_when_the_observables_determine_them(key) -> N
     correct result and it is **not** a validation: a method that recovered
     nothing would pass it identically. This is the test a referee will ask for.
 
-    The recipe comes from measuring ``effective_parameters`` against the
-    observable set (``reports/M2M_production_readiness.md``, A2): it saturates
-    at ``min(n, m_effective)``, so a problem with more *effective* observables
-    than weights has its ceiling at ``n`` and the weights become identifiable.
-    Both halves are asserted below on the **same 32 orbits**, so the only thing
-    that differs between the two outcomes is what was observed:
+    WHAT IS A BOUND AND WHAT IS A MEASUREMENT. ``effective_parameters`` cannot
+    exceed ``min(m, n)``. The first row below therefore reports 10.00 of 32
+    because arithmetic requires it, and asserting it checks only that the
+    diagnostic respects its own ceiling. The rows that carry a claim are the two
+    with ``m = 64 > n = 32``, where the ceiling is ``n`` and the value is free to
+    land anywhere below it: one saturates at 32.00 and the other stops at 13.84.
+    Sixty-four numbers can determine every weight or fewer than half of them,
+    according to what was measured, and that is the property this test exists to
+    hold. All four rows share the **same 32 orbits**, so only the observation
+    differs.
 
-    ===========================  =====  ==============  ==========  ==============
-    observable set               ``m``  ``eff`` of 32   ``chi2``    weight error
-    ===========================  =====  ==============  ==========  ==============
-    5 radial bins x 2 moments    10     **10.00**       3.7e-15     **0.182**
-    LOSVD, 8 radii x 8 speeds    64     **32.00**       1.9e-05     **6.7e-03**
-    ===========================  =====  ==============  ==========  ==============
+    ===============================  =====  ==============  ==========  ==============
+    observable set                   ``m``  ``eff`` of 32   ``chi2``    weight error
+    ===============================  =====  ==============  ==========  ==============
+    5 radial bins x 2 moments        10     **10.00**       3.7e-15     **0.182**
+    32 radial bins x 2, width 0.6    64     **13.84**       1.2e-07     **0.173**
+    LOSVD, 8 radii x 8 speeds        64     **32.00**       1.9e-05     **6.7e-03**
+    ===============================  =====  ==============  ==========  ==============
 
-    The radial row was ``4.2e-14`` / ``0.211`` until 2026-10-02, when
-    ``studies/sensitivity_figure.py`` -- which draws this comparison and so had
-    to reproduce it -- measured ``3.7e-15`` / ``0.182`` from this file's own
-    helpers. The assertions below are bounds and passed either way, which is
-    why the drift was not caught here. Only the *under-determined* row moved:
-    with 22 of its 32 directions exactly unconstrained, LBFGS stops somewhere
-    in a 22-dimensional flat subspace and the weight error records where, not
-    how well it did. Treat that number as indicative; the LOSVD row is
-    reproducible and is the one that carries a claim.
+    Read the two ``m = 64`` rows together, because they are the comparison that
+    is not arithmetic. The redundant radial set reaches a chi-squared **160
+    times smaller** than the LOSVD and recovers the weights **26 times less
+    accurately**. The fit is not what fails; the observations are, and
+    ``effective_parameters`` reports which case a given instrument puts you in
+    before the fit is run.
 
-    Read the rows together. The first reaches a chi-squared 9 orders of
-    magnitude smaller and a weight error **27 times larger**: the fit is not
-    what fails, the observables are. Made-to-measure recovers the weights
-    exactly when the data determine them, and ``effective_parameters`` says in
-    advance which case a given instrument puts you in.
+    A LIMIT ON THE QUANTITY. It separates the under-determined from the
+    determined case sharply, but it does not finely predict the weight error
+    *within* the under-determined regime: 13.84 and 10.00 give 0.173 and 0.182,
+    because in both the error is dominated by the prior filling a null space of
+    comparable size. It reports which regime you are in, not how wrong you will
+    be inside it.
 
-    The 6.7e-03 is **the optimizer's residual, not the method's floor.** Solved
-    to the minimum by damped Newton instead of LBFGS the same problem recovers
-    to ``1.8e-11`` at ``mu = 1e-10``, and the error is then exactly the entropy
-    prior's bias -- it scales **linearly in mu** over nine decades
+    ON THE UNDER-DETERMINED ROWS' REPRODUCIBILITY. The ``m = 10`` row read
+    ``4.2e-14`` / ``0.211`` until 2026-10-02, when ``studies/sensitivity_figure.py``
+    measured ``3.7e-15`` / ``0.182`` from this file's own helpers. The assertions
+    are bounds and passed either way. With 22 of its 32 directions exactly
+    unconstrained, LBFGS stops somewhere in a 22-dimensional flat subspace and
+    the weight error records where, not how well it did. Treat both
+    under-determined weight errors as indicative; the LOSVD row is the one that
+    reproduces.
+
+    The ``6.7e-03`` is **the optimizer's residual, not the method's floor.**
+    Solved to the minimum by damped Newton instead of LBFGS the same problem
+    recovers to ``1.8e-11`` at ``mu = 1e-10``, and the error is then exactly the
+    entropy prior's bias -- it scales **linearly in mu** over nine decades
     (1.8e-11, 1.8e-09, ..., 1.7e-04 at ``mu = 1e-3``), which is the sharp form
     of the statement. LBFGS is asserted here rather than Newton because LBFGS is
     what the package ships; it stops with ``|dF/dw| = 0.3`` on this problem.
@@ -1655,6 +1667,13 @@ def test_the_weights_are_recovered_when_the_observables_determine_them(key) -> N
     kernels = {
         "radial": GaussianRadialBins(
             centres=jnp.linspace(0.4, 2.0, 5), width=0.3, moments=("mass", "v2")
+        ),
+        # Same observable count as the LOSVD below, so that the comparison
+        # between them is about information rather than about counting. The
+        # bins are spaced 0.05 apart and 0.6 wide, so they overlap heavily and
+        # the set is redundant by construction.
+        "radial_wide": GaussianRadialBins(
+            centres=jnp.linspace(0.4, 2.0, 32), width=0.6, moments=("mass", "v2")
         ),
         "losvd": _losvd_kernel(8, 8, radial_width=0.25, velocity_width=0.18),
     }
@@ -1687,21 +1706,35 @@ def test_the_weights_are_recovered_when_the_observables_determine_them(key) -> N
             error=float(jnp.linalg.norm(weights - truth) / jnp.linalg.norm(truth)),
         )
 
-    radial, losvd = outcomes["radial"], outcomes["losvd"]
+    radial = outcomes["radial"]
+    wide = outcomes["radial_wide"]
+    losvd = outcomes["losvd"]
 
-    # The precondition, which is the transferable part: eff saturates at the
-    # observable count in one case and at the weight count in the other.
-    assert radial["m"] == 10 and losvd["m"] == 64
+    # The ceiling, which is arithmetic: eff cannot exceed min(m, n).
+    assert radial["m"] == 10
     assert radial["effective"] == pytest.approx(10.0, rel=1.0e-3), radial
-    assert losvd["effective"] == pytest.approx(float(n), rel=1.0e-3), losvd
 
-    # The consequence. The under-determined fit reaches the *smaller*
-    # chi-squared and the *larger* weight error -- both directions asserted, so
-    # a regression that merely fitted better could not pass this.
+    # The measurement, which is not. Both of these have m = 64 > n = 32, so the
+    # ceiling is n for both and the values are free to differ -- and they do, by
+    # more than a factor of two. A diagnostic that merely counted observables
+    # could not tell these two apart.
+    assert wide["m"] == 64 and losvd["m"] == 64
+    assert losvd["effective"] == pytest.approx(float(n), rel=1.0e-3), losvd
+    assert wide["effective"] == pytest.approx(13.84, rel=5.0e-2), wide
+    assert wide["effective"] < 0.6 * losvd["effective"], (wide, losvd)
+
+    # The consequence, asserted between the two sets of equal size so that it
+    # cannot be explained by one of them having had more numbers. The redundant
+    # set fits better and recovers worse, and both directions are asserted, so a
+    # regression that merely fitted better could not pass this.
+    assert wide["chi_squared"] < 0.1 * losvd["chi_squared"], (wide, losvd)
+    assert wide["error"] > 0.1, wide
+    assert losvd["error"] < 2.0e-2, losvd
+    assert losvd["error"] < 0.1 * wide["error"], (losvd, wide)
+
+    # The original m = 10 row still behaves as before.
     assert radial["chi_squared"] < 1.0e-10, radial
     assert radial["error"] > 0.15, radial
-    assert losvd["error"] < 2.0e-2, losvd
-    assert losvd["error"] < 0.1 * radial["error"], (losvd, radial)
 
 
 def test_the_weights_are_recovered_in_the_self_consistent_construction() -> None:

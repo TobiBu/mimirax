@@ -1617,7 +1617,7 @@ def test_the_weights_are_recovered_when_the_observables_determine_them(key) -> N
     reproducible and is the one that carries a claim.
 
     Read the rows together. The first reaches a chi-squared 9 orders of
-    magnitude smaller and a weight error **31 times larger**: the fit is not
+    magnitude smaller and a weight error **27 times larger**: the fit is not
     what fails, the observables are. Made-to-measure recovers the weights
     exactly when the data determine them, and ``effective_parameters`` says in
     advance which case a given instrument puts you in.

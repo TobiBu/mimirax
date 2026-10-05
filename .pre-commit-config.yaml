@@ -1,16 +1,16 @@
 repos:
   - repo: https://github.com/psf/black-pre-commit-mirror
-    rev: 26.5.1
+    rev: 26.10.0
     hooks:
       - id: black
 
   - repo: https://github.com/PyCQA/isort
-    rev: 9.0.1
+    rev: 9.0.2
     hooks:
       - id: isort
 
   - repo: https://github.com/jsh9/pydoclint
-    rev: 0.9.1
+    rev: 0.11.0
     hooks:
       - id: pydoclint
         # Config lives in pyproject.toml so that
@@ -20,7 +20,7 @@ repos:
         args: ["--config", "pyproject.toml"]
 
   - repo: https://github.com/PyCQA/flake8
-    rev: 7.3.0
+    rev: 7.4.1
     hooks:
       - id: flake8
         # UNDEFINED NAMES ONLY -- not a style linter. black, isort and pydoclint

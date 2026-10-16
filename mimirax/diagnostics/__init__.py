@@ -8,6 +8,7 @@ from mimirax.diagnostics.convergence import has_converged, relative_change
 from mimirax.diagnostics.degeneracy import (
     degenerate_directions,
     effective_parameters,
+    effective_parameters_from_jacobian,
     fisher_information,
     l_curve_corner,
     profile_likelihood,
@@ -17,6 +18,7 @@ from mimirax.diagnostics.residuals import normalized_residuals, residuals, rms_r
 __all__ = [
     "degenerate_directions",
     "effective_parameters",
+    "effective_parameters_from_jacobian",
     "fisher_information",
     "has_converged",
     "l_curve_corner",

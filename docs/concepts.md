@@ -103,6 +103,13 @@ prior_curvature)` returns `tr(H_data (H_data + H_prior)^-1)`, the effective degr
 out; the other 54 are the prior's. No optimizer, step size or `mu` moves that, so "make the
 objective more informative" means more or better observables and nothing else.
 
+Given the Jacobian of the *prediction* instead of a Hessian, `effective_parameters_from_jacobian`
+returns the same number from an SVD of the noise- and prior-whitened Jacobian, and it is the one
+to use. It keeps working in single precision, where forming `JᵀC⁻¹J` loses every direction near
+the prior's threshold and the dense route returns noise. It never counts residual curvature as
+information: away from an exact fit of a nonlinear model, a Hessian is not a Fisher matrix. And
+with a diagonal prior such as the entropy prior's `mu / w`, it never forms a `d × d` matrix.
+
 **The conditioning is the practical problem.** The objective is *strictly convex* in the weights,
 so the minimum is unique — but the Fisher condition number is 2.6e7, and every Adam rate and
 schedule tried plateaus 2 % short of it while LBFGS reaches it and the classic force of change

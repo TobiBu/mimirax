@@ -59,6 +59,8 @@ solver-specific glue is in `mimirax/adapters/`, behind optional extras.
 - Diagnostics: residuals, convergence from the objective trace, Fisher information, its
   degenerate directions, and `effective_parameters` — how many parameters the *data* determined,
   which on a regularized fit is the number that says whether the objective is informative
+  (`effective_parameters_from_jacobian` computes it from the Jacobian by an SVD, and is the one
+  to use in single precision and away from an exact fit)
 - Made-to-measure, in two variants on one objective: `MadeToMeasure.minimize` differentiates
   the time-averaged posterior *through the orbit integration*; `MadeToMeasure.force_of_change`
   is Syer & Tremaine's classic weight update, kept as the oracle the first is measured against

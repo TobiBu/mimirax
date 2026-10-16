@@ -14,6 +14,7 @@ from ._registry import Registry  # noqa: E402
 from .diagnostics import (  # noqa: E402
     degenerate_directions,
     effective_parameters,
+    effective_parameters_from_jacobian,
     fisher_information,
     has_converged,
     l_curve_corner,
@@ -130,6 +131,7 @@ __all__ = [
     "constraint_violation",
     "degenerate_directions",
     "effective_parameters",
+    "effective_parameters_from_jacobian",
     "fisher_information",
     "has_converged",
     "l_curve_corner",

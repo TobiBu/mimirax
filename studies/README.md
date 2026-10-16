@@ -34,6 +34,7 @@ JSON.
 | Study | Question | Outputs |
 |---|---|---|
 | `sensitivity_figure.py` | What do the data actually constrain, and which datum says so? | `results/sensitivity_figure.json`, `sensitivity_information_{light,dark}.{pdf,png}`, `sensitivity_information_map_{light,dark}.{pdf,png}` |
+| `fisher_fd_vs_ad.py` | Does a finite-difference Fisher matrix overstate what the data constrain? | `results/fisher_fd_vs_ad.json`, `fisher_fd_vs_ad.{pdf,png}` |
 
 ### `sensitivity_figure.py`
 
@@ -52,3 +53,27 @@ Two things worth knowing before editing it:
 - **The LOSVD kernel is defined locally**, not imported. D-027 keeps domain
   observables in the domain packages; the integration test carries its own copy for
   the same reason, and this is that copy.
+
+### `fisher_fd_vs_ad.py`
+
+Builds the Fisher matrix `Jᵀ C⁻¹ J` from AD and from careful finite differences (forward,
+central, Richardson) at a fixed step ladder and at the default steps, in single and double
+precision, and compares each against the double-precision AD reference: the Jacobian error, the
+spectrum eigenvalue by eigenvalue, `effective_parameters`, the degenerate subspace and the
+cross/quadratic split of the error. Three arms: the sensitivity figure's tracer problem (linear in
+the weights, so finite differences' best case), the self-consistent construction where the
+weights are the masses, and three source masses of an external field (`P = 3`).
+
+Three things worth knowing before editing it:
+
+- **The two precisions run in separate processes.** `jax_enable_x64` is process-wide, so the
+  script launches itself twice as a worker, with the precision passed in
+  `FISHER_PROBE_PRECISION` and set before `jax.numpy` is imported. Every observable, Jacobian
+  and spectrum a worker produces has its dtype asserted. Do not import `sensitivity_figure.py`
+  from it: that module turns x64 on at import.
+- **All analysis is in double precision**, on Jacobians cast after they were measured, so rows
+  differ only in the derivative method and the arithmetic it ran in. The `native` columns are what
+  a pipeline kept in one precision throughout would get.
+- **At uniform weights the shipped Hessian route is not a Fisher matrix** in the
+  self-consistent case: the residual curvature is non-zero there. The script uses Gauss–Newton
+  `Jᵀ C⁻¹ J` throughout.

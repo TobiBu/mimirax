@@ -37,6 +37,10 @@ from typing import Any
 import jax
 
 jax.config.update("jax_enable_x64", True)
+if os.environ.get("LONG_HORIZON_DEVICE"):  # pick one of several visible devices
+    jax.config.update(
+        "jax_default_device", jax.devices()[int(os.environ["LONG_HORIZON_DEVICE"])]
+    )
 
 import jax.numpy as jnp  # noqa: E402
 import numpy as np  # noqa: E402
@@ -412,6 +416,100 @@ class CountingEngine:
         return self.inner(theta, positions, velocities, masses, segment)
 
 
+class ProgressLog:
+    """Host-side progress of one fit, written while it runs.
+
+    The augmented-Lagrangian driver calls the forward model's ``prepare(params)``
+    on the host, with concrete parameters, before every inner step; the models
+    below forward that to :meth:`record`, which keeps the step count and the
+    latest ``theta`` and every :attr:`every` steps writes them (with the segment
+    passes so far) to :attr:`path` -- so a fit stopped by a time limit still
+    leaves where it got to. Inactive while :attr:`path` is ``None``.
+
+    Parameters
+    ----------
+    counter : CountingEngine
+        Supplies the pass count.
+    every : int
+        Steps between writes.
+    """
+
+    def __init__(self, counter: "CountingEngine", every: int = 25) -> None:
+        self.counter = counter
+        self.every = every
+        self.path: Path | None = None
+        self.steps = 0
+        self.start = 0.0
+        self.meta: dict[str, Any] = {}
+
+    def reset(self, path: Path | None, **meta: Any) -> None:
+        """Start (or, with ``path=None``, stop) logging a fit.
+
+        Parameters
+        ----------
+        path : Path | None
+            Where to write the partial record.
+        **meta : Any
+            Copied into every record.
+        """
+        import time
+
+        self.path, self.steps, self.start, self.meta = path, 0, time.time(), meta
+
+    def record(self, theta: Any) -> None:
+        """Count one inner step; write the partial record every :attr:`every`.
+
+        Parameters
+        ----------
+        theta : Any
+            The step's (concrete) ``theta``.
+        """
+        import time
+
+        if self.path is None:
+            return
+        self.steps += 1
+        if self.steps % self.every:
+            return
+        values = theta_array(theta)
+        write_json(
+            self.path,
+            {
+                **self.meta,
+                "inner_steps_so_far": self.steps,
+                "segment_passes_so_far": self.counter.passes,
+                "theta": values.tolist(),
+                "error": (values - theta_array(TRUTH)).tolist(),
+                "elapsed_s_information_only": time.time() - self.start,
+            },
+        )
+
+
+@dataclass(frozen=True)
+class LoggedShootingModel(MultipleShootingForwardModel):
+    """:class:`~mimirax.MultipleShootingForwardModel` reporting to a :class:`ProgressLog`.
+
+    Attributes
+    ----------
+    log : ProgressLog | None
+        Gets every ``prepare``'s ``theta``.
+    """
+
+    log: ProgressLog | None = None
+
+    def prepare(self, params: Any) -> None:
+        """Delegate to the base class, then record the step.
+
+        Parameters
+        ----------
+        params : Any
+            Concrete parameters of the next step.
+        """
+        super().prepare(params)
+        if self.log is not None:
+            self.log.record(params["theta"])
+
+
 @dataclass(frozen=True)
 class SeriesModel:
     """Single shooting with the time-series data: one chained rollout, params ``{"theta"}``.
@@ -428,9 +526,23 @@ class SeriesModel:
     ----------
     model : MultipleShootingForwardModel
         Supplies the engine, masses, initial condition and ``S``.
+    log : ProgressLog | None
+        Gets every ``prepare``'s ``theta``.
     """
 
     model: MultipleShootingForwardModel
+    log: ProgressLog | None = None
+
+    def prepare(self, params: Any) -> None:
+        """Record the step (host; the driver calls it before every inner step).
+
+        Parameters
+        ----------
+        params : Any
+            Concrete ``{"theta": ...}``.
+        """
+        if self.log is not None:
+            self.log.record(params["theta"])
 
     def __call__(self, params: Any) -> dict[str, Any]:
         """Return every segment end along the one trajectory at ``params["theta"]``.
@@ -495,6 +607,8 @@ class Problems:
         The noisy data.
     clean : Any
         The noise-free data at the truth.
+    log : ProgressLog
+        Progress of the fit running on either problem.
     """
 
     system: System
@@ -505,6 +619,7 @@ class Problems:
     counter: CountingEngine
     observed: Any
     clean: Any
+    log: ProgressLog
 
 
 def problems(
@@ -539,15 +654,17 @@ def problems(
         Both problems on the same observations.
     """
     counter = CountingEngine(engine((segment_steps,) * num_segments, system))
-    model = MultipleShootingForwardModel(
+    log = ProgressLog(counter)
+    model = LoggedShootingModel(
         counter,  # pyright: ignore[reportArgumentType]
         system.masses,
         num_segments,
         system.positions,
         system.velocities,
         output="segment_ends",
+        log=log,
     )
-    series = SeriesModel(model)
+    series = SeriesModel(model, log=log)
     clean = jax.jit(lambda th: phase_space(series({"theta": th})))(TRUTH)
     per_snapshot = clean.size // num_segments
     noise = jax.random.normal(
@@ -558,7 +675,7 @@ def problems(
     single = InferenceProblem(series, phase_space, likelihood, observed)
     multiple = InferenceProblem(model, phase_space, likelihood, observed)
     return Problems(
-        system, num_segments, single, multiple, model, counter, observed, clean
+        system, num_segments, single, multiple, model, counter, observed, clean, log
     )
 
 
@@ -605,7 +722,7 @@ def write_json(path: Path, record: dict[str, Any]) -> None:
         JSON-serialisable.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
+    tmp = path.with_suffix(f".{os.getpid()}.tmp")  # concurrent writers: own temp
     tmp.write_text(json.dumps(record, indent=1, allow_nan=True) + "\n")
     tmp.replace(path)
 

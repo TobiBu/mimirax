@@ -109,7 +109,12 @@ def start_theta(k: int, radius: float) -> np.ndarray:
     return c.theta_array(c.TRUTH) + radius * u / np.linalg.norm(u)
 
 
-def fit(problems: c.Problems, method: str, theta0: np.ndarray) -> dict[str, Any]:
+def fit(
+    problems: c.Problems,
+    method: str,
+    theta0: np.ndarray,
+    partial: Path | None = None,
+) -> dict[str, Any]:
     """Run one fit and return its record.
 
     Parameters
@@ -120,6 +125,10 @@ def fit(problems: c.Problems, method: str, theta0: np.ndarray) -> dict[str, Any]
         ``"single"``, ``"multiple"`` or ``"multiple_data"``.
     theta0 : np.ndarray
         Start.
+    partial : Path | None
+        Where the fit's progress is written while it runs (removed when it
+        ends): a fit stopped by a time limit leaves its last ``theta`` and pass
+        count there.
 
     Returns
     -------
@@ -146,9 +155,14 @@ def fit(problems: c.Problems, method: str, theta0: np.ndarray) -> dict[str, Any]
         raise ValueError(f"unknown method {method!r}")
     jax.effects_barrier()
     problems.counter.passes = 0
+    if partial is not None:
+        problems.log.reset(partial, method=method, theta0=np.asarray(theta0).tolist())
     start = time.time()
     result = driver().minimize(problem, params)
     jax.effects_barrier()
+    problems.log.reset(None)
+    if partial is not None:
+        partial.unlink(missing_ok=True)
     wall = time.time() - start
     outer = len(result.outer_steps)
     passes = problems.counter.passes - outer * problems.num_segments
@@ -289,7 +303,9 @@ def main() -> int:
                 if path.exists():
                     continue
                 theta0 = start_theta(k, args.radius)
-                record = fit(problems, method, theta0)
+                partial = root / "partial" / path.name
+                partial.parent.mkdir(parents=True, exist_ok=True)
+                record = fit(problems, method, theta0, partial)
                 final = np.asarray(record["theta"])
                 error = final - c.theta_array(c.TRUTH)
                 objective = single_objective(problems, final)

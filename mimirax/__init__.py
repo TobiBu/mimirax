@@ -28,6 +28,8 @@ from .inference import (  # noqa: E402
     HMC,
     METHODS,
     NUTS,
+    AugmentedLagrangian,
+    AugmentedLagrangianResult,
     DataResampling,
     InferenceProblem,
     MadeToMeasure,
@@ -36,6 +38,8 @@ from .inference import (  # noqa: E402
     OptaxOptimizer,
     ProblemEvaluation,
     adam,
+    augmented_lagrangian_value,
+    defect_violation,
     made_to_measure,
 )
 from .likelihoods import LIKELIHOODS, GaussianLikelihood, chi_squared  # noqa: E402
@@ -91,6 +95,8 @@ from .types import FitResult, SampleResult  # noqa: E402
 
 __all__ = [
     "AffineTransform",
+    "AugmentedLagrangian",
+    "AugmentedLagrangianResult",
     "Constraint",
     "DataResampling",
     "EntropyPrior",
@@ -137,10 +143,12 @@ __all__ = [
     "TotalMassConstraint",
     "WeightedKernelSum",
     "adam",
+    "augmented_lagrangian_value",
     "centre_of_mass",
     "chi_squared",
     "constrain",
     "constraint_violation",
+    "defect_violation",
     "degenerate_directions",
     "effective_parameters",
     "effective_parameters_from_jacobian",

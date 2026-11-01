@@ -556,7 +556,13 @@ def test_gpu_fused_lane_driver_and_a_failed_verdict_on_two_cards() -> None:
     """The driver (Adam) on two cards: one trace per segment, no re-plan; then a far
     cap cut below its need in segment 1: ``check`` fails for segment 1 alone,
     ``prepare`` re-plans it alone, only its program is traced again, the redo
-    passes. The system of :func:`test_gpu_fused_lane_segments_on_two_cards`."""
+    passes. The system of :func:`test_gpu_fused_lane_segments_on_two_cards`.
+
+    Measured (cards 6 + 7, 2026-11-01): 2 Adam steps, 2 traces, no redo, no
+    pre-pass (L 59793.40 -> 58843.31, violation 5.0e-5 / 6.0e-5 absolute); the cut
+    cap: 1 redo, 1 pre-pass (segment 1's), 3 traces (segment 0 once, segment 1 on
+    the cut plan and on its new one). 19.5 min for the test (compiles).
+    """
     gpus = _gpus()[:2]
     s = _fused_setup(gpus)
     engine, problem, params = s["engine"], s["problem"], s["params"]

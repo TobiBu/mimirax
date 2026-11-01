@@ -125,6 +125,12 @@ def _args(argv: Optional[list] = None) -> argparse.Namespace:
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--no-al-memory", action="store_true", help="memory: segments only")
     ap.add_argument(
+        "--segment-variant",
+        default="engine",
+        choices=("engine", "direct"),
+        help="memory: the engine's segment, or one rollout with its start force inside",
+    )
+    ap.add_argument(
         "--only",
         default="seggrad",
         choices=("prepass", "seggrad", "alstep"),
@@ -243,6 +249,24 @@ def _card_state() -> dict:
         return {"utilization": gpu, "other_processes": others or "none"}
     except Exception as exc:  # noqa: BLE001
         return {"other_processes": f"nvidia-smi failed: {exc}"}
+
+
+def _heads() -> dict:
+    """The checkouts' HEADs (mimirax, jaccpot, nornax), as imported."""
+    out = {}
+    for name in ("mimirax", "jaccpot", "nornax"):
+        try:
+            module = __import__(name)
+            root = os.path.dirname(os.path.dirname(os.path.abspath(module.__file__)))
+            out[name] = subprocess.run(
+                ["git", "-C", root, "rev-parse", "--short", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            ).stdout.strip()
+        except Exception as exc:  # noqa: BLE001
+            out[name] = f"unknown: {exc}"
+    return out
 
 
 def _bpp(nbytes: Any, n: int) -> Any:
@@ -589,11 +613,67 @@ def task_prepass(args: argparse.Namespace, rec: dict, compiles: Compiles) -> Non
         gc.collect()
 
 
-def _segment_program(engine: Any, k: int) -> Any:
+def _direct_segment(engine: Any, k: int) -> Any:
+    """Segment ``k`` as ONE ``differentiable_rollout`` that computes its own start force.
+
+    The runner's gradient plan (``GradientPlan.rollout``) evaluates a ``"start"``
+    segment's start force OUTSIDE the rollout's hand-written reverse (under
+    ``jax.checkpoint``, the field added eagerly so the forward is the runner's
+    bit for bit); S9 session 2 (D, 374228f5) moved the plain rollout's start force
+    INSIDE the adjoint, as unit 0 of its one reverse loop (W 775 -> 450 B/p at
+    8e6). This variant passes ``acceleration=None`` with the plan's seed, the
+    plan's provider and statics: the W the engine would have with that lever. Its
+    forward is not the runner's bitwise (the field is added inside the program).
+    """
+    from jaccpot.production import _trace_state_kept
+    from jaccpot.production_grad import _install_plan, _under_plan
+    from jaccpot.runtime.grad_rollout import differentiable_rollout
+
+    plan = engine.plans[k]
+    (seg,) = plan.segments
+    assert seg.kind == "start", seg.kind
+
+    def run(theta: Any, x: Any, v: Any, m: Any) -> Any:
+        import jax.numpy as jnp
+
+        in_chain = [True]
+        with _trace_state_kept(plan.engine):
+            _install_plan(plan.engine, seg.plan)
+            step_fn = _under_plan(
+                plan.engine, seg.plan, seg.provider.differentiable_step, in_chain
+            )
+            out = differentiable_rollout(
+                step_fn,
+                x,
+                v,
+                m,
+                plan.params["dt"],
+                seg.steps,
+                params=plan.params["force_params"],
+                aux=(jnp.asarray(seg.seed), None, None),
+                external_fn=plan.external_fn,
+                external_args=theta,
+                checkpoint="step",
+            )
+        in_chain[0] = False
+        return out
+
+    return run
+
+
+def _segment_program(engine: Any, k: int, variant: str = "engine") -> Any:
     import jax
     import jax.numpy as jnp
 
+    direct = _direct_segment(engine, k) if variant == "direct" else None
+
     def loss(theta: Any, x: Any, v: Any, m: Any, w: Any) -> Any:
+        if direct is not None:
+            out = direct(theta, x, v, m)
+            value = jnp.sum(w * out.positions.astype(jnp.float64)) + jnp.sum(
+                w * out.velocities.astype(jnp.float64)
+            )
+            return value, out.aux[1]
         end = engine(theta, x, v, m, k)
         value = jnp.sum(w * end.positions.astype(jnp.float64)) + jnp.sum(
             w * end.velocities.astype(jnp.float64)
@@ -628,7 +708,7 @@ def segment_memory(
         mark = compiles.mark()
         t0 = time.perf_counter()
         compiled = (
-            _segment_program(engine, k)
+            _segment_program(engine, k, args.segment_variant)
             .lower(truth, nodes["positions"][k], nodes["velocities"][k], m, w)
             .compile()
         )
@@ -1318,6 +1398,7 @@ def main(argv: Optional[list] = None) -> int:
         "device": str(jax.devices()[0]),
         "jax": jax.__version__,
         "card_before": _card_state(),
+        "heads": _heads(),
     }
     print(
         f"{args.task}: N {args.n}, {args.segments} x {args.steps} steps, dt {args.dt}, "

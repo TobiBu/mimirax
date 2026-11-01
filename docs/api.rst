@@ -88,6 +88,17 @@ Inference
    :members:
    :undoc-members:
 
+.. automodule:: mimirax.inference.augmented_lagrangian
+   :members:
+   :undoc-members:
+
+Multiple shooting
+-----------------
+
+.. automodule:: mimirax.shooting
+   :members:
+   :undoc-members:
+
 Diagnostics
 -----------
 

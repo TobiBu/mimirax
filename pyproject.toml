@@ -28,8 +28,8 @@ dependencies = [
   # jaxlib must track jax (the nornax note applies: a mismatched floor lets the
   # resolver pair an old jaxlib with a new jax and break jaxtyping at import).
   # No upper bound: mimirax has no Pallas kernel or collective that pins an XLA
-  # behaviour, and it must co-install beside jaccpot's `>=0.10.2,<0.11` window
-  # and nornax's `>=0.8.0` floor.
+  # behaviour, and it must co-install beside jaccpot's `>=0.11.2,<0.12` window
+  # and nornax's `>=0.8.0` floor (the CI's solver-tests job resolves all three).
   "jax>=0.8.0",
   "jaxlib>=0.8.0",
   "jaxtyping>=0.2.34",

@@ -64,7 +64,7 @@ from typing import Any, Optional
 
 import numpy as np
 
-TASKS = ("prepass", "memory", "fd", "al", "timing")
+TASKS = ("prepass", "memory", "fd", "al", "timing", "parity")
 #: (log M, log r_s) of the NFW halo
 TRUTH = (math.log(5.0), math.log(3.0))
 _ENV_KEYS = (
@@ -90,6 +90,12 @@ def _args(argv: Optional[list] = None) -> argparse.Namespace:
     ap.add_argument("--dt", type=float, default=0.01)
     ap.add_argument("--softening", type=float, default=None)
     ap.add_argument("--disc-mass", type=float, default=1e-2)
+    ap.add_argument(
+        "--system",
+        default="disc",
+        choices=("disc", "plummer"),
+        help="plummer: S9's clipped Plummer (W calibration against S9's rows)",
+    )
     ap.add_argument(
         "--cell-min-level",
         type=int,
@@ -326,6 +332,26 @@ def theta_values(theta: Any) -> list:
     return [float(theta["log_halo_mass"]), float(theta["log_halo_scale"])]
 
 
+def system(args: argparse.Namespace) -> tuple:
+    """``(x, v, m)`` of ``--system``: the disc, or S9's clipped Plummer (calibration)."""
+    if args.system == "disc":
+        return disc(args.n, args.seed, args.disc_mass)
+    import jax.numpy as jnp
+
+    # jaccpot bench/grad_rollout_memory.py's _plummer: clipped at 20 scale radii,
+    # velocities 0.1 N(0, 1), total mass 1 -- the S9 memory rows' system
+    rng = np.random.default_rng(args.seed)
+    u = rng.uniform(0.0, 1.0, args.n)
+    r = np.minimum(1.0 / np.sqrt(u ** (-2.0 / 3.0) - 1.0), 20.0)
+    mu = rng.uniform(-1.0, 1.0, args.n)
+    phi = rng.uniform(0.0, 2.0 * np.pi, args.n)
+    st = np.sqrt(1.0 - mu * mu)
+    x = np.stack([r * st * np.cos(phi), r * st * np.sin(phi), r * mu], 1)
+    v = 0.1 * rng.normal(size=(args.n, 3))
+    m = np.full((args.n,), 1.0 / args.n)
+    return tuple(jnp.asarray(a_, jnp.float32) for a_ in (x, v, m))
+
+
 def disc(n: int, seed: int, disc_mass: float) -> tuple:
     """``(x, v, m)``, float32: near-circular orbits in the true potential (float64 field)."""
     import jax.numpy as jnp
@@ -494,7 +520,7 @@ def setup(args: argparse.Namespace, rec: dict, compiles: Compiles) -> dict:
     """The engine planned at the truth, the observations, the start (nodes planned there)."""
     import jax.numpy as jnp
 
-    x, v, m = disc(args.n, args.seed, args.disc_mass)
+    x, v, m = system(args)
     engine = make_engine(args)
     log: list = []
     count_plans(engine, compiles, log)
@@ -533,7 +559,7 @@ def setup(args: argparse.Namespace, rec: dict, compiles: Compiles) -> dict:
 
 
 def task_prepass(args: argparse.Namespace, rec: dict, compiles: Compiles) -> None:
-    x, v, m = disc(args.n, args.seed, args.disc_mass)
+    x, v, m = system(args)
     truth = theta_of(TRUTH)
     offset = [float(s) for s in args.offset.split(",")]
     start = theta_of([TRUTH[0] + offset[0], TRUTH[1] + offset[1]])
@@ -584,7 +610,7 @@ def segment_memory(
     import jax
     import jax.numpy as jnp
 
-    x, v, m = disc(args.n, args.seed, args.disc_mass)
+    x, v, m = system(args)
     engine = make_engine(args, steps=steps)
     log: list = []
     count_plans(engine, compiles, log)
@@ -970,6 +996,8 @@ def fisher(args: argparse.Namespace, s: dict, h: float = 1e-2) -> dict:
 
 
 def task_al(args: argparse.Namespace, rec: dict, compiles: Compiles) -> None:
+    import jax
+
     s = setup(args, rec, compiles)
     engine = s["engine"]
     model, problem = build_problem(args, engine, s["x"], s["v"], s["m"], s["observed"])
@@ -978,7 +1006,36 @@ def task_al(args: argparse.Namespace, rec: dict, compiles: Compiles) -> None:
     plans_before = engine.stats["plans"]
     mark = compiles.mark()
     t0 = time.perf_counter()
+    # progress: one line per verdict (every step, redo, line-search trial and
+    # measurement checks the segments once)
+    inner_check = engine.check
+    progress: list = []
+
+    def check(auxes: Any) -> bool:
+        ok = inner_check(auxes)
+        progress.append((round(time.perf_counter() - t0, 1), bool(ok)))
+        if len(progress) % 10 == 1 or not ok:
+            print(
+                f"  check {len(progress)} at {progress[-1][0]} s: ok {ok}, "
+                f"plans {engine.stats['plans']}, compiles {compiles.count}",
+                flush=True,
+            )
+        return ok
+
+    engine.check = check
+    devs = devices_of(args) or jax.devices()[:1]
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
+    rec["layout"] = [
+        {
+            "segment": k,
+            "device": str(devs[k % len(devs)]),
+            "physical_card": cvd[devs[k % len(devs)].id] if cvd != [""] else None,
+        }
+        for k in range(args.segments)
+    ]
     result = driver.minimize(problem, params)
+    engine.check = inner_check
+    rec["checks_timeline"] = progress
     rec["al_s"] = round(time.perf_counter() - t0, 1)
     rec["al_compiles"] = compiles.since(mark)
     rec["after_al"] = _alloc()
@@ -1004,12 +1061,17 @@ def task_al(args: argparse.Namespace, rec: dict, compiles: Compiles) -> None:
         "objective_trace_tail": [float(k) for k in result.objective_trace[-10:]],
         "violation_trace_tail": [float(k) for k in result.violation_trace[-10:]],
     }
-    # the objective at the truth (with nodes propagated there) for comparison
     import jax
 
-    measure = jax.jit(lambda p: problem.evaluate(p).negative_log_posterior)
+    rec["result"]["peak_per_device"] = {
+        str(d): (d.memory_stats() or {}).get("peak_bytes_in_use")
+        for d in (devices_of(args) or jax.devices()[:1])
+    }
+    rec["result"]["line_search_trials"] = None
+    # the objective at the truth (its trajectory: defects zero): the noise's chi^2 / 2
+    clean, observed = np.asarray(s["clean"]), np.asarray(s["observed"])
     rec["result"]["objective_at_truth"] = float(
-        measure({"theta": s["truth"], "nodes": free_nodes(s["truth_nodes"])})
+        0.5 * np.sum(((clean - observed) / args.sigma) ** 2)
     )
     rec["result"]["fisher"] = fisher(args, s)
     std = rec["result"]["fisher"]["std"]
@@ -1017,6 +1079,84 @@ def task_al(args: argparse.Namespace, rec: dict, compiles: Compiles) -> None:
         e / sd for e, sd in zip(rec["result"]["error"], std)
     ]
     print(json.dumps(rec["result"], indent=1), flush=True)
+
+
+def task_parity(args: argparse.Namespace, rec: dict, compiles: Compiles) -> None:
+    """The per-segment mode's summed value and gradient against the one program.
+
+    At the start (nodes moved off the propagated ends by 1e-3, nonzero
+    multipliers), ``AugmentedLagrangian``'s one-program Lagrangian (the data as
+    arguments) on device 0 against ``ParallelSegmentObjective`` on
+    ``--devices K`` (segment k on device k mod K): the value and every gradient
+    leaf, max abs difference relative to the leaf's max abs, and the bitwise
+    count. Records which segment ran on which device (and physical card).
+    """
+    import jax
+    import jax.numpy as jnp
+
+    from mimirax.inference.augmented_lagrangian import augmented_lagrangian_value
+    from mimirax.inference.parallel import ParallelSegmentObjective
+
+    s = setup(args, rec, compiles)
+    model, problem = build_problem(
+        args, s["engine"], s["x"], s["v"], s["m"], s["observed"]
+    )
+    p0 = {"theta": s["start"], "nodes": free_nodes(s["start_nodes"])}
+    d = jnp.asarray(
+        np.random.default_rng(23).normal(size=p0["nodes"]["positions"].shape),
+        jnp.float32,
+    )
+    p0["nodes"] = {**p0["nodes"], "positions": p0["nodes"]["positions"] + 1e-3 * d}
+    rng = np.random.default_rng(17)
+    shape = (args.segments - 1, args.n, 6)
+    lam = (jnp.asarray(rng.normal(size=shape) * 1e2, jnp.float32),)
+    mu = jnp.asarray(args.mu0, jnp.float64)
+
+    def one(p: Any, data: Any) -> Any:
+        bound = problem.with_data_arrays(data)
+        value, evaluation = augmented_lagrangian_value(bound, p, lam, mu)
+        return value, tuple(a[1] for a in evaluation.aux)
+
+    (v1, bits1), g1 = jax.jit(jax.value_and_grad(one, has_aux=True))(
+        p0, problem.data_arrays()
+    )
+    devices = devices_of(args) or jax.devices()[:1]
+    objective = ParallelSegmentObjective(problem, devices)
+    contributions, auxes = objective.dispatch(p0, lam, mu)
+    v2, g2, _f, _defects = jax.jit(objective.assemble)(p0, contributions)
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
+    rec["layout"] = [
+        {
+            "segment": k,
+            "device": str(dev),
+            "physical_card": cvd[dev.id] if dev.id < len(cvd) and cvd != [""] else None,
+        }
+        for k, dev in enumerate(objective.segment_devices)
+    ]
+    rows = {
+        "value": {
+            "one": float(v1),
+            "split": float(v2),
+            "diff": float(v2) - float(v1),
+            "relative": abs(float(v2) - float(v1)) / abs(float(v1)),
+        }
+    }
+    leaves1, tree = jax.tree_util.tree_flatten_with_path(g1)
+    leaves2 = jax.tree_util.tree_leaves(g2)
+    for (path, a), b in zip(leaves1, leaves2):
+        a, b = np.asarray(a), np.asarray(jax.device_get(b))
+        name = jax.tree_util.keystr(path)
+        rows[name] = {
+            "max_abs_diff_rel": float(
+                np.max(np.abs(a - b)) / max(np.max(np.abs(a)), 1e-300)
+            ),
+            "elements_differ": int(np.sum(a != b)),
+            "size": int(a.size),
+        }
+    rec["parity"] = rows
+    rec["bits_one"] = [int(b) for b in bits1]
+    rec["bits_split"] = [int(a[1]) for a in auxes]
+    print(json.dumps({"layout": rec["layout"], "parity": rows}, indent=1), flush=True)
 
 
 def _reps(fn: Any, reps: int) -> dict:
@@ -1053,7 +1193,7 @@ def task_timing(args: argparse.Namespace, rec: dict, compiles: Compiles) -> None
     timing: dict = {}
     rec["timing"] = timing
     if only == "prepass":
-        x, v, m = disc(args.n, args.seed, args.disc_mass)
+        x, v, m = system(args)
         engine = make_engine(args, freeze_cache=not args.no_freeze_cache)
         log: list = []
         count_plans(engine, compiles, log)
@@ -1079,7 +1219,7 @@ def task_timing(args: argparse.Namespace, rec: dict, compiles: Compiles) -> None
         timing["freeze_cache"] = not args.no_freeze_cache
         rec["prepasses"] = log
     elif only == "seggrad":
-        x, v, m = disc(args.n, args.seed, args.disc_mass)
+        x, v, m = system(args)
         engine = make_engine(args)
         truth = theta_of(TRUTH)
         nodes = engine.propagate(truth, x, v, m)
@@ -1191,6 +1331,7 @@ def main(argv: Optional[list] = None) -> int:
         "fd": task_fd,
         "al": task_al,
         "timing": task_timing,
+        "parity": task_parity,
     }[args.task](args, rec, compiles)
     rec["wall_s"] = round(time.perf_counter() - t0, 1)
     rec["compiles_total"] = {

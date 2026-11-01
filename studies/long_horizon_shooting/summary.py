@@ -213,27 +213,70 @@ def recovery_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
             reference[f"S{r['segments']:02d}"] = r["objective_at_truth"]
             continue
         groups[(r["method"], r["segments"], r["radius"])].append(r)
+    # fits stopped by a process time limit: their last progress record
+    for path in sorted((c.RUNS / "recovery" / "partial").glob("*.json")):
+        if (c.RUNS / "recovery" / path.name).exists():
+            continue  # finished after all
+        p = json.loads(path.read_text())
+        name = path.stem  # <method>_S<ss>_r<radius>_k<kk>
+        method = name.split("_S")[0]
+        s_ = int(name.split("_S")[1][:2])
+        radius = float(name.split("_r")[1].split("_k")[0])
+        groups[(method, s_, radius)].append(
+            {
+                "error": p["error"],
+                "segment_passes": p["segment_passes_so_far"],
+                "inner_steps": p["inner_steps_so_far"],
+                "outer_iterations": None,
+                "converged": False,
+                "status": "time limit",
+                "objective_above_truth": None,
+                "wall_s_information_only": p["elapsed_s_information_only"],
+                "history_steps_passes_maxerror": p.get("history", []),
+                "start": int(name.split("_k")[1]),
+            }
+        )
     configs = {}
     for (method, s, radius), rows in sorted(groups.items()):
+        rows.sort(key=lambda r: r["start"])
         passes = np.asarray([r["segment_passes"] for r in rows], float)
         err = np.asarray([np.max(np.abs(r["error"])) for r in rows])
         ok = [bool(e <= SUCCESS_TOL) for e in err]
+        status = [
+            r.get("status") or ("converged" if r["converged"] else "budget")
+            for r in rows
+        ]
+        # passes until theta first came within the tolerance (the cost of the
+        # answer, before the driver's own stopping rule); single-shooting fits
+        # shorter than one history interval count their total
+        to_tol = []
+        for r, good in zip(rows, ok):
+            hits = [
+                h[1]
+                for h in r.get("history_steps_passes_maxerror") or []
+                if h[2] <= SUCCESS_TOL
+            ]
+            to_tol.append(hits[0] if hits else (r["segment_passes"] if good else None))
+        reached = [t for t in to_tol if t is not None]
         configs[f"{method}_S{s:02d}_r{radius:g}"] = {
             "method": method,
             "segments": s,
             "radius": radius,
             "starts": len(rows),
+            "start_indices": [r["start"] for r in rows],
             "successes": int(sum(ok)),
             "success_rate": float(np.mean(ok)),
+            "status_per_start": status,
+            "segment_passes_per_start": passes.tolist(),
             "segment_passes_median": float(np.median(passes)),
             "segment_passes_min": float(passes.min()),
             "segment_passes_max": float(passes.max()),
+            "passes_to_tolerance_per_start": to_tol,
+            "passes_to_tolerance_median": (
+                float(np.median(reached)) if reached else None
+            ),
             "evaluations_median": float(np.median(passes) / s),
             "inner_steps_median": float(np.median([r["inner_steps"] for r in rows])),
-            "outer_iterations_median": float(
-                np.median([r["outer_iterations"] for r in rows])
-            ),
-            "converged": int(sum(r["converged"] for r in rows)),
             "error_max_abs_median": float(np.median(err)),
             "error_max_abs_per_start": err.tolist(),
             "objective_above_truth_per_start": [

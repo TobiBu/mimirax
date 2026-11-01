@@ -160,6 +160,7 @@ def fit(
     start = time.time()
     result = driver().minimize(problem, params)
     jax.effects_barrier()
+    history = list(problems.log.history)
     problems.log.reset(None)
     if partial is not None:
         partial.unlink(missing_ok=True)
@@ -179,6 +180,7 @@ def fit(
         "outer_violation": np.asarray(result.outer_violation).tolist(),
         "outer_mu": np.asarray(result.outer_mu).tolist(),
         "num_traces": int(result.num_traces),
+        "history_steps_passes_maxerror": history,
         "wall_s_information_only": wall,
     }
 

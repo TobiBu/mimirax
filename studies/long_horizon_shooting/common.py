@@ -441,6 +441,8 @@ class ProgressLog:
         self.steps = 0
         self.start = 0.0
         self.meta: dict[str, Any] = {}
+        #: ``[inner steps, segment passes, max |theta - theta*|]`` at every write
+        self.history: list[list[float]] = []
 
     def reset(self, path: Path | None, **meta: Any) -> None:
         """Start (or, with ``path=None``, stop) logging a fit.
@@ -455,6 +457,8 @@ class ProgressLog:
         import time
 
         self.path, self.steps, self.start, self.meta = path, 0, time.time(), meta
+        if path is not None:
+            self.history: list[list[float]] = []
 
     def record(self, theta: Any) -> None:
         """Count one inner step; write the partial record every :attr:`every`.
@@ -472,6 +476,10 @@ class ProgressLog:
         if self.steps % self.every:
             return
         values = theta_array(theta)
+        error = values - theta_array(TRUTH)
+        self.history.append(
+            [self.steps, self.counter.passes, float(np.max(np.abs(error)))]
+        )
         write_json(
             self.path,
             {
@@ -479,8 +487,9 @@ class ProgressLog:
                 "inner_steps_so_far": self.steps,
                 "segment_passes_so_far": self.counter.passes,
                 "theta": values.tolist(),
-                "error": (values - theta_array(TRUTH)).tolist(),
+                "error": error.tolist(),
                 "elapsed_s_information_only": time.time() - self.start,
+                "history": self.history,
             },
         )
 

@@ -114,6 +114,7 @@ def fit(
     method: str,
     theta0: np.ndarray,
     partial: Path | None = None,
+    cap_s: float = 0.0,
 ) -> dict[str, Any]:
     """Run one fit and return its record.
 
@@ -129,6 +130,10 @@ def fit(
         Where the fit's progress is written while it runs (removed when it
         ends): a fit stopped by a time limit leaves its last ``theta`` and pass
         count there.
+    cap_s : float
+        Wall-time cap of the fit in seconds (``0``: none; needs ``partial``). A
+        capped fit returns its last progress record, ``status="time cap"``:
+        a measurement budget for the cards, NOT the driver's stopping rule.
 
     Returns
     -------
@@ -156,9 +161,30 @@ def fit(
     jax.effects_barrier()
     problems.counter.passes = 0
     if partial is not None:
-        problems.log.reset(partial, method=method, theta0=np.asarray(theta0).tolist())
+        problems.log.reset(
+            partial, method=method, theta0=np.asarray(theta0).tolist(), cap_s=cap_s
+        )
     start = time.time()
-    result = driver().minimize(problem, params)
+    try:
+        result = driver().minimize(problem, params)
+    except c.FitTimeCap:
+        jax.effects_barrier()
+        assert partial is not None
+        last = c.read_json(partial)
+        problems.log.reset(None)
+        partial.unlink(missing_ok=True)
+        return {
+            "theta": last["theta"],
+            "converged": False,
+            "status": "time cap",
+            "time_cap_s": cap_s,
+            "outer_iterations": None,
+            "inner_steps": last["inner_steps_so_far"],
+            "segment_passes": int(last["segment_passes_so_far"]),
+            "evaluations": last["segment_passes_so_far"] / problems.num_segments,
+            "history_steps_passes_maxerror": last["history"],
+            "wall_s_information_only": time.time() - start,
+        }
     jax.effects_barrier()
     history = list(problems.log.history)
     problems.log.reset(None)
@@ -180,6 +206,7 @@ def fit(
         "outer_violation": np.asarray(result.outer_violation).tolist(),
         "outer_mu": np.asarray(result.outer_mu).tolist(),
         "num_traces": int(result.num_traces),
+        "status": "converged" if result.converged else "budget",
         "history_steps_passes_maxerror": history,
         "wall_s_information_only": wall,
     }
@@ -293,6 +320,9 @@ def main() -> int:
     parser.add_argument("--segments", default=",".join(map(str, SEGMENTS)))
     parser.add_argument("--starts", default=f"0-{K - 1}")
     parser.add_argument("--radius", type=float, default=RADIUS)
+    parser.add_argument(
+        "--cap-min", type=float, default=0.0, help="wall-time cap per fit, minutes"
+    )
     args = parser.parse_args()
     root = c.RUNS / "recovery"
     system = c.build_system()
@@ -307,7 +337,7 @@ def main() -> int:
                 theta0 = start_theta(k, args.radius)
                 partial = root / "partial" / path.name
                 partial.parent.mkdir(parents=True, exist_ok=True)
-                record = fit(problems, method, theta0, partial)
+                record = fit(problems, method, theta0, partial, 60.0 * args.cap_min)
                 final = np.asarray(record["theta"])
                 error = final - c.theta_array(c.TRUTH)
                 objective = single_objective(problems, final)

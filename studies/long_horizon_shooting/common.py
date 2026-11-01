@@ -416,6 +416,10 @@ class CountingEngine:
         return self.inner(theta, positions, velocities, masses, segment)
 
 
+class FitTimeCap(Exception):
+    """Raised by :meth:`ProgressLog.record` when a fit exceeds its wall-time cap."""
+
+
 class ProgressLog:
     """Host-side progress of one fit, written while it runs.
 
@@ -452,11 +456,13 @@ class ProgressLog:
         path : Path | None
             Where to write the partial record.
         **meta : Any
-            Copied into every record.
+            Copied into every record; ``cap_s`` (popped) is a wall-time cap in
+            seconds: past it the next write raises :class:`FitTimeCap`.
         """
         import time
 
         self.path, self.steps, self.start, self.meta = path, 0, time.time(), meta
+        self.cap_s = float(meta.pop("cap_s", 0.0) or 0.0)
         if path is not None:
             self.history: list[list[float]] = []
 
@@ -467,6 +473,11 @@ class ProgressLog:
         ----------
         theta : Any
             The step's (concrete) ``theta``.
+
+        Raises
+        ------
+        FitTimeCap
+            When the fit has run past its wall-time cap.
         """
         import time
 
@@ -492,6 +503,8 @@ class ProgressLog:
                 "history": self.history,
             },
         )
+        if self.cap_s and time.time() - self.start > self.cap_s:
+            raise FitTimeCap(f"{self.steps} inner steps in {self.cap_s:.0f} s")
 
 
 @dataclass(frozen=True)

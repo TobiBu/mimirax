@@ -328,7 +328,17 @@ def _disc(n: int) -> tuple:
     return tuple(jnp.asarray(a_, jnp.float32) for a_ in (x, v, m))
 
 
+_FUSED: dict = {}
+
+
 def _fused_setup(gpus) -> dict:
+    """The fused system, planned once per process (both GPU tests use it)."""
+    if "setup" not in _FUSED:
+        _FUSED["setup"] = _build_fused(gpus)
+    return _FUSED["setup"]
+
+
+def _build_fused(gpus) -> dict:
     from jaccpot import FastMultipoleMethod
     from jaccpot.production import ProductionRunner, SegmentConfig
 
@@ -452,11 +462,18 @@ def test_gpu_fused_lane_segments_on_two_cards() -> None:
     * the plans: what device arrays a ``GradientPlan`` holds, and each segment's
       arrays (dt, G / softening, the f_b seed) placed on its card;
     * a segment program's HLO holds no large constant (the seeds, the masses,
-      node 0 and the data are arguments);
-    * the driver (Adam) in parallel: one trace per segment, no re-plan;
-    * a far cap cut below its need in segment 1: ``check`` fails for segment 1
-      alone, ``prepare`` re-plans it alone, only its program is traced again,
-      and the redo passes.
+      node 0 and the data are arguments).
+
+    Measured (cards 6 + 7, 2026-11-01, fusion autotuner off): two cards against
+    the same programs on one card BITWISE, and against the one program (both
+    segments and the sum in one jitted value-and-gradient on card 6) BITWISE too
+    (value 5.98e4, theta and node gradients); a plan's device arrays are its
+    scalar ``dt`` and the pre-pass's ``external_params`` (the field's theta,
+    replaced by the traced theta), on the pre-pass's device -- the f_b seeds are
+    host numpy, the providers and segment plans hold no device buffer; each
+    segment's arrays placed on its card; the largest constant of a segment
+    program 4 elements, 20000 (= N, the seed) with the plan's own arrays. 17 min
+    for the test (compiles; shared host).
     """
     gpus = _gpus()[:2]
     s = _fused_setup(gpus)
@@ -533,9 +550,19 @@ def test_gpu_fused_lane_segments_on_two_cards() -> None:
     assert _differ(grads["theta"], grads_p["theta"])[1] < 1e-4
     assert _differ(grads["nodes"], grads_p["nodes"])[1] < 1e-4
 
-    # the driver in parallel: no re-plan, one trace per segment
+
+@gpu
+def test_gpu_fused_lane_driver_and_a_failed_verdict_on_two_cards() -> None:
+    """The driver (Adam) on two cards: one trace per segment, no re-plan; then a far
+    cap cut below its need in segment 1: ``check`` fails for segment 1 alone,
+    ``prepare`` re-plans it alone, only its program is traced again, the redo
+    passes. The system of :func:`test_gpu_fused_lane_segments_on_two_cards`."""
+    gpus = _gpus()[:2]
+    s = _fused_setup(gpus)
+    engine, problem, params = s["engine"], s["problem"], s["params"]
     plans = engine.stats["plans"]
-    traces = two.num_traces
+
+    # the driver in parallel: no re-plan, one trace per segment
     driver = AugmentedLagrangian(
         optimizer=optax.adam(1e-5), inner_steps=2, max_outer=1, devices=gpus
     )
@@ -549,7 +576,6 @@ def test_gpu_fused_lane_segments_on_two_cards() -> None:
     )
     assert engine.stats["plans"] == plans
     assert result.num_traces == 2 and result.num_redos == 0
-    del traces
 
     # segment 1's far cap cut below its need: re-planned alone, redone
     engine.plans[1] = _shrunk(engine.plans[1])

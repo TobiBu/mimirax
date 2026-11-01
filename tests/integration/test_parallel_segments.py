@@ -174,7 +174,7 @@ def test_direct_sum_parallel_step_equals_the_one_program(num_segments) -> None:
 def test_direct_sum_driver_in_parallel(num_segments) -> None:
     """Two outer x 5 inner Adam steps; params, traces and the histories.
 
-    Measured: 2 segments bitwise; 4 segments within 1.8e-16 relative (41
+    Measured (alone): 2 segments bitwise; 4 segments within 1.8e-16 relative (41
     elements of the parameters after 10 steps, one theta component by 1 ulp): the
     multiplier and penalty terms of three defects are summed per segment, then
     over segments, where the one program sums each over the stacked defects.
@@ -187,9 +187,9 @@ def test_direct_sum_driver_in_parallel(num_segments) -> None:
     many = AugmentedLagrangian(devices=_devices(), **kwargs).minimize(problem, params)
     diff = _differ(many.params, one.params)
     _report(f"S={num_segments}: driver, parallel vs one program", params=diff)
-    if num_segments == 2:
-        assert diff == (0, 0.0)
-        assert _differ(many.lagrangian_trace, one.lagrangian_trace) == (0, 0.0)
+    # bitwise for S = 2 when run alone; asserted to round-off, because a
+    # pytest-xdist worker that ran other tests first compiled one of the two
+    # programs differently (15 elements by 2.0e-17 relative)
     assert diff[1] < 1e-14
     assert _differ(many.violation_trace, one.violation_trace)[1] < 1e-13
     assert one.num_traces == 1 and many.num_traces == 2
@@ -244,7 +244,11 @@ gpu = pytest.mark.skipif(
 def test_gpu_direct_sum_parallel_equals_one_program() -> None:
     """Float64 direct sum, 2 and 4 segments on two GPUs against one program on one.
 
-    Measured (cards 6 + 7): see the report; asserted to round-off.
+    Measured (cards 6 + 7, N = 256, 10-step segments, 2026-11-01): two cards
+    against the same segment programs on one card bitwise (S = 2 and 4); against
+    the one program the value bitwise and the gradient bitwise for S = 2, one
+    element by 1.6e-16 relative for S = 4; the driver (2 x 3 Adam steps) bitwise
+    for both; 2 segment traces against the one program's 1.
     """
     gpus = _gpus()
     for num_segments in (2, 4):
@@ -392,6 +396,20 @@ def _shrunk(plan: Any, factor: int = 4) -> Any:
     return dataclasses.replace(plan, segments=(shrunk,), _programs={})
 
 
+def _largest_constant(text: str) -> int:
+    """The element count of the largest non-splat ``stablehlo.constant`` in ``text``."""
+    import re
+
+    largest = 0
+    pattern = (
+        r'stablehlo\.constant dense<("0x[0-9A-Fa-f]+"|\[[^>]*?\])> : tensor<([^>]*)>'
+    )
+    for _, shape in re.findall(pattern, text):
+        dims = [int(d) for d in shape.split("x")[:-1] if d.isdigit()]
+        largest = max(largest, int(np.prod(dims)) if dims else 1)
+    return largest
+
+
 def _device_arrays(root: Any, skip: tuple = ("engine",)) -> list:
     """Every ``jax.Array`` reachable from ``root`` (attributes, containers), with
     its path, skipping attributes named in ``skip``."""
@@ -467,8 +485,11 @@ def test_gpu_fused_lane_segments_on_two_cards() -> None:
             next(iter(leaf.devices())) == device
             for leaf in jax.tree_util.tree_leaves(evaluation.aux[k])
         )
-    # the segment programs hold no large constant
-    texts = []
+    # the segment programs hold no [N]-sized constant. (Their text is ~1e8
+    # characters at any N: the Pallas kernels' Triton IR in the custom calls'
+    # backend_config, ~650 of them; not data.) With the plan's own arrays (no
+    # ``arrays``) segment 0's f_b seed is an [N] constant.
+    largest = {}
     for k, device in enumerate(gpus):
         states = two._states(params)
         args = (
@@ -481,11 +502,15 @@ def test_gpu_fused_lane_segments_on_two_cards() -> None:
             two._observations[k],
             engine.segment_arrays(k, device=device),
         )
-        texts.append(two._program("value_and_grad", k).lower(*args).as_text())
-    largest = max(len(t) for t in texts)
-    dense = [t.count("dense<[") for t in texts]
-    _report("segment program HLO", chars=[len(t) for t in texts], dense_constants=dense)
-    assert largest < 40 * FUSED_N  # an embedded [N] constant would be ~N * 15 chars
+        program = two._program("value_and_grad", k)
+        largest[k] = _largest_constant(program.lower(*args).as_text())
+        if k == 0:
+            largest["0, plan's own arrays"] = _largest_constant(
+                program.lower(*args[:-1], None).as_text()
+            )
+    _report("largest constant in a segment program (elements)", largest=largest)
+    assert largest[0] < FUSED_N and largest[1] < FUSED_N
+    assert largest["0, plan's own arrays"] >= FUSED_N
 
     one_card = ParallelSegmentObjective(problem, gpus[:1])
     value_1, grads_1, _ = one_card.value_and_grad(params, lam, mu)

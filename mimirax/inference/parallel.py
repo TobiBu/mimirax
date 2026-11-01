@@ -163,17 +163,18 @@ class ParallelSegmentObjective:
         self._programs: dict[tuple, Callable[..., Any]] = {}
         self._assemble = jax.jit(self.assemble)
         self._assemble_forward = jax.jit(self.assemble_forward)
-        data = self.model.data_arrays()
+        # placed ONCE (the engine's per-plan arrays are placed by the engine)
+        masses = jnp.asarray(self.model.masses)
         self._masses = {
-            device: jax.device_put(data["masses"], device)
+            device: jax.device_put(masses, device)
             for device in set(self.segment_devices)
         }
         self._initial: Any = None
         if not self.model.free_initial:
             self._initial = jax.device_put(
                 {
-                    "positions": data["initial_positions"],
-                    "velocities": data["initial_velocities"],
+                    "positions": jnp.asarray(self.model.initial_positions),
+                    "velocities": jnp.asarray(self.model.initial_velocities),
                 },
                 self.segment_devices[0],
             )

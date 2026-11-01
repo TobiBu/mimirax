@@ -5,7 +5,8 @@ Every entry satisfies :class:`~mimirax.protocols.Optimizer` or
 :class:`MadeToMeasure` are implemented, as is :class:`DataResampling` for
 uncertainties on made-to-measure weights, and :class:`AugmentedLagrangian` for
 equality-constrained problems (multiple shooting; it takes the problem, not a
-bare objective, so it is not registered as an ``Optimizer``); :class:`HMC`,
+bare objective, so it is not registered as an ``Optimizer``; its ``devices=``
+mode runs one program per segment through :class:`ParallelSegmentObjective`); :class:`HMC`,
 :class:`NUTS`, :class:`MeanFieldVI` and :class:`NelderMead` are stubs that fix
 names and signatures. Register new methods with ``METHODS.register(name, cls)``.
 """
@@ -22,6 +23,7 @@ from mimirax.inference.hmc import HMC, NUTS
 from mimirax.inference.m2m import MadeToMeasure, made_to_measure
 from mimirax.inference.objective import InferenceProblem, ProblemEvaluation
 from mimirax.inference.optimizers import OptaxOptimizer, adam
+from mimirax.inference.parallel import ParallelSegmentObjective, SegmentContribution
 from mimirax.inference.resampling import DataResampling
 from mimirax.inference.vi import MeanFieldVI
 
@@ -37,7 +39,9 @@ __all__ = [
     "MeanFieldVI",
     "NelderMead",
     "OptaxOptimizer",
+    "ParallelSegmentObjective",
     "ProblemEvaluation",
+    "SegmentContribution",
     "adam",
     "augmented_lagrangian_value",
     "defect_violation",

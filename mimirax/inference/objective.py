@@ -18,10 +18,24 @@ consumes it. :meth:`InferenceProblem.log_posterior` adds them as the quadratic
 penalty (:func:`~mimirax.parameters.quadratic_penalty`, weight
 :attr:`InferenceProblem.penalty_weight`), the baseline any optimizer can use. A
 problem with neither runs the code it always ran, bit for bit.
+
+DATA AS ARGUMENTS. :meth:`InferenceProblem.data_arrays` collects what the
+objective reads but never differentiates -- the observations, the likelihood's
+arrays (a per-point ``sigma``), the forward model's (a multiple-shooting model's
+masses and initial condition, its engine's per-segment arrays) -- and
+:meth:`InferenceProblem.with_data_arrays` rebuilds the problem around (traced)
+replacements. The augmented-Lagrangian driver passes them to its jitted programs
+as arguments: closed over, they would be constants embedded in the program.
+
+SEGMENTS. :meth:`InferenceProblem.segment_split` says how the objective of a
+multiple-shooting problem splits over the segments (the forward model's
+``split_objective`` capability), which
+:mod:`mimirax.inference.parallel` needs to run one program per segment.
 """
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from typing import Any, NamedTuple
 
@@ -145,6 +159,77 @@ class InferenceProblem:
         return ProblemEvaluation(
             negative_log_posterior=negative, defects=defects, aux=aux
         )
+
+    def data_arrays(self) -> dict:
+        """Return the arrays the objective reads but does not differentiate. Host.
+
+        Returns
+        -------
+        dict
+            ``observed``; ``likelihood`` and ``forward``: their ``data_arrays()``
+            when they have the capability, else ``None``.
+        """
+        likelihood = getattr(self.likelihood, "data_arrays", None)
+        forward = getattr(self.forward, "data_arrays", None)
+        return {
+            "observed": self.observed,
+            "likelihood": None if likelihood is None else likelihood(),
+            "forward": None if forward is None else forward(),
+        }
+
+    def with_data_arrays(self, data: dict) -> InferenceProblem:
+        """Return the problem reading ``data`` (e.g. a program's arguments).
+
+        Parameters
+        ----------
+        data : dict
+            As :meth:`data_arrays` returned it, or tracers of it.
+
+        Returns
+        -------
+        InferenceProblem
+            The same problem; its parts with the capability rebuilt around their
+            entries.
+        """
+        likelihood, forward = self.likelihood, self.forward
+        if data.get("likelihood") is not None:
+            likelihood = getattr(likelihood, "with_data_arrays")(data["likelihood"])
+        if data.get("forward") is not None:
+            forward = getattr(forward, "with_data_arrays")(data["forward"])
+        return dataclasses.replace(
+            self, forward=forward, likelihood=likelihood, observed=data["observed"]
+        )
+
+    def segment_split(self) -> Any:
+        """Return how the objective splits over the forward model's segments.
+
+        Separable: a forward model with the ``split_objective`` capability
+        (:meth:`mimirax.MultipleShootingForwardModel.split_objective`) and no
+        explicit :attr:`constraints` (a constraint of the whole parameter vector
+        couples the segments).
+
+        Returns
+        -------
+        Any
+            The forward model's :class:`~mimirax.shooting.SegmentSplit`.
+
+        Raises
+        ------
+        ValueError
+            If the problem does not split (the message says why).
+        """
+        if self.constraints:
+            raise ValueError(
+                "a problem with explicit constraints does not split over segments: "
+                "each constraint reads the whole parameter vector"
+            )
+        split = getattr(self.forward, "split_objective", None)
+        if split is None:
+            raise ValueError(
+                f"{type(self.forward).__name__} has no split_objective: only a "
+                "multiple-shooting forward model splits over segments"
+            )
+        return split(self.observable, self.likelihood, self.observed)
 
     def penalty(self, defects: tuple[Array, ...]) -> Scalar:
         """Return the quadratic penalty of already-computed defects.

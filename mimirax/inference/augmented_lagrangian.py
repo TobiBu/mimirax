@@ -30,14 +30,36 @@ traced segment computes unless its ``check`` has just failed.
 posterior and ``c`` its defects, from ONE pass of the forward model;
 :attr:`InferenceProblem.penalty_weight` is not used (the driver owns the
 penalty).
+
+DATA ARE ARGUMENTS. The problem's data -- the observations, the forward model's
+masses and initial condition, a segment engine's per-segment arrays
+(:meth:`InferenceProblem.data_arrays`) -- are arguments of the jitted step and
+measurement, not constants of them (a constant is embedded in the program: at
+``N = 1e5-1e6`` that is the whole data set, in every compiled program).
+
+SEGMENTS IN PARALLEL (``devices=``). By default the step is ONE program: the
+whole augmented Lagrangian, its gradient and the optax update. With
+:attr:`AugmentedLagrangian.devices` the step of a problem that splits over its
+segments (:meth:`InferenceProblem.segment_split`) is one value-and-gradient
+program per segment, segment ``k`` on ``devices[k % len(devices)]``, all
+dispatched before any is read, then one program on ``devices[0]`` that sums the
+contributions and applies the optax update
+(:class:`~mimirax.inference.parallel.ParallelSegmentObjective`). The loops, the
+``prepare`` / ``check`` / redo protocol and the stopping rules are the same code
+in both modes. Two differences: :attr:`AugmentedLagrangianResult.num_traces`
+counts the segment programs' traces (one per segment key: equal direct-sum
+segments share one), and an optax rule that calls ``value_fn`` (``optax.lbfgs()``
+with its default zoom line search) is refused -- a line search needs the whole
+objective inside the update program; ``optax.lbfgs(linesearch=None)`` and Adam
+work.
 """
 
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, Optional
 
 import jax
 import jax.numpy as jnp
@@ -301,6 +323,12 @@ class AugmentedLagrangian:
         iteration's, or ``mu`` grows.
     max_redo : int
         Re-prepares allowed per step after a failed ``check`` before giving up.
+    devices : Optional[Sequence[Any]]
+        ``None`` (default): the step is one program (session 1's). A sequence of
+        devices: one program per segment, segment ``k`` on ``devices[k %
+        len(devices)]``, the parameters, the optimizer state and the sum on
+        ``devices[0]`` (module docstring). The problem must split over its
+        segments, or :meth:`minimize` raises.
     """
 
     optimizer: optax.GradientTransformation = field(
@@ -317,11 +345,15 @@ class AugmentedLagrangian:
     mu_max: float = 1.0e12
     shrink: float = 0.25
     max_redo: int = 3
+    devices: Optional[Sequence[Any]] = None
 
     def _compile(
         self, problem: InferenceProblem, counter: list[int]
     ) -> tuple[Callable[..., _StepOut], Callable[..., Any]]:
-        """Build the jitted inner step and the jitted measurement.
+        """Build the jitted inner step and the jitted measurement (one program each).
+
+        The problem's data (:meth:`InferenceProblem.data_arrays`) are the last
+        argument of both.
 
         Parameters
         ----------
@@ -333,27 +365,28 @@ class AugmentedLagrangian:
         Returns
         -------
         tuple[Callable[..., _StepOut], Callable[..., Any]]
-            ``step(params, opt_state, multipliers, mu)`` and
-            ``measure(params) -> (f, violation, defects, aux)``.
+            ``step(params, opt_state, multipliers, mu, data)`` and
+            ``measure(params, data) -> (f, violation, defects, aux)``.
         """
         rule = optax.with_extra_args_support(self.optimizer)
 
-        def lagrangian(p, multipliers, mu):
-            value, evaluation = augmented_lagrangian_value(problem, p, multipliers, mu)
+        def lagrangian(p, multipliers, mu, data):
+            bound = problem.with_data_arrays(data)
+            value, evaluation = augmented_lagrangian_value(bound, p, multipliers, mu)
             return value, evaluation
 
         value_and_grad = jax.value_and_grad(lagrangian, has_aux=True)
 
-        def step(p, opt_state, multipliers, mu):
+        def step(p, opt_state, multipliers, mu, data):
             counter[0] += 1  # runs at trace time only
-            (value, evaluation), grads = value_and_grad(p, multipliers, mu)
+            (value, evaluation), grads = value_and_grad(p, multipliers, mu, data)
             updates, opt_state = rule.update(
                 grads,
                 opt_state,
                 p,
                 value=value,
                 grad=grads,
-                value_fn=lambda q: lagrangian(q, multipliers, mu)[0],
+                value_fn=lambda q: lagrangian(q, multipliers, mu, data)[0],
             )
             return _StepOut(
                 params=_strong(optax.apply_updates(p, updates)),
@@ -364,8 +397,8 @@ class AugmentedLagrangian:
                 aux=evaluation.aux,
             )
 
-        def measure(p):
-            evaluation = problem.evaluate(p)
+        def measure(p, data):
+            evaluation = problem.with_data_arrays(data).evaluate(p)
             return (
                 evaluation.negative_log_posterior,
                 defect_violation(evaluation.defects),
@@ -374,6 +407,23 @@ class AugmentedLagrangian:
             )
 
         return jax.jit(step), jax.jit(measure)
+
+    def _evaluator(self, problem: InferenceProblem) -> Any:
+        """Return the step / measurement pair for this driver's mode.
+
+        Parameters
+        ----------
+        problem : InferenceProblem
+            The problem.
+
+        Returns
+        -------
+        Any
+            A :class:`_OneProgram` (``devices=None``) or a :class:`_PerSegment`.
+        """
+        if self.devices is None:
+            return _OneProgram(self, problem)
+        return _PerSegment(self, problem, self.devices)
 
     def minimize(
         self, problem: InferenceProblem, params: PyTree
@@ -402,11 +452,12 @@ class AugmentedLagrangian:
             re-prepares.
         """
         forward = problem.forward
-        counter = [0]
-        step, measure = self._compile(problem, counter)
-        shapes = jax.eval_shape(problem.evaluate, params).defects
-        multipliers = tuple(jnp.zeros(s.shape, s.dtype) for s in shapes)
-        params = _strong(params)
+        evaluator = self._evaluator(problem)
+        multipliers = tuple(
+            jnp.zeros(s.shape, s.dtype) for s in evaluator.defect_shapes(params)
+        )
+        params = evaluator.place(_strong(params))
+        multipliers = evaluator.place(multipliers)
         mu = float(self.mu0)
         redos = 0
         trace: dict[str, list[float]] = {
@@ -432,7 +483,7 @@ class AugmentedLagrangian:
             taken = 0
             for _ in range(self.inner_steps):
                 _host_prepare(forward, params)
-                out = step(params, opt_state, multipliers, mu_array)
+                out = evaluator.step(params, opt_state, multipliers, mu_array)
                 attempts = 0
                 while not _host_check(forward, out.aux):
                     attempts += 1
@@ -443,8 +494,8 @@ class AugmentedLagrangian:
                             "one step; re-preparing did not fix it"
                         )
                     _host_prepare(forward, params)
-                    step, measure = self._compile(problem, counter)
-                    out = step(params, opt_state, multipliers, mu_array)
+                    evaluator.refresh()
+                    out = evaluator.step(params, opt_state, multipliers, mu_array)
                 value = float(out.lagrangian)
                 trace["objective"].append(float(out.objective))
                 trace["violation"].append(float(out.violation))
@@ -459,11 +510,11 @@ class AugmentedLagrangian:
                 previous_value = value
 
             _host_prepare(forward, params)
-            objective, violation, defects, aux = measure(params)
+            objective, violation, defects, aux = evaluator.measure(params)
             if not _host_check(forward, aux):
                 _host_prepare(forward, params)
-                step, measure = self._compile(problem, counter)
-                objective, violation, defects, aux = measure(params)
+                evaluator.refresh()
+                objective, violation, defects, aux = evaluator.measure(params)
             objective, violation = float(objective), float(violation)
             outer["objective"].append(objective)
             outer["violation"].append(violation)
@@ -496,6 +547,265 @@ class AugmentedLagrangian:
             outer_steps=jnp.asarray(outer["steps"], dtype=jnp.int32),
             multipliers=multipliers,
             converged=converged,
-            num_traces=counter[0],
+            num_traces=evaluator.num_traces,
             num_redos=redos,
         )
+
+
+class _OneProgram:
+    """The step and the measurement as one program each (session 1's mode).
+
+    Parameters
+    ----------
+    driver : AugmentedLagrangian
+        The driver (its optimizer).
+    problem : InferenceProblem
+        The problem.
+    """
+
+    def __init__(self, driver: AugmentedLagrangian, problem: InferenceProblem) -> None:
+        self.driver = driver
+        self.problem = problem
+        self._counter = [0]
+        self._step, self._measure = driver._compile(problem, self._counter)
+
+    @property
+    def num_traces(self) -> int:
+        """Return how many times the step was traced.
+
+        Returns
+        -------
+        int
+            The count.
+        """
+        return self._counter[0]
+
+    def defect_shapes(self, params: PyTree) -> tuple:
+        """Return the shapes of the defects (traces the problem once, abstractly).
+
+        Parameters
+        ----------
+        params : PyTree
+            The parameters.
+
+        Returns
+        -------
+        tuple
+            One ``ShapeDtypeStruct`` per defect.
+        """
+        return tuple(jax.eval_shape(self.problem.evaluate, params).defects)
+
+    def place(self, tree: PyTree) -> PyTree:
+        """Return ``tree`` unchanged (the default device).
+
+        Parameters
+        ----------
+        tree : PyTree
+            Parameters or multipliers.
+
+        Returns
+        -------
+        PyTree
+            ``tree``.
+        """
+        return tree
+
+    def refresh(self) -> None:
+        """Build the programs again: they are traced again at their next call."""
+        self._step, self._measure = self.driver._compile(self.problem, self._counter)
+
+    def step(self, params: PyTree, opt_state: Any, multipliers: Any, mu: Any) -> Any:
+        """Run one inner step.
+
+        Parameters
+        ----------
+        params : PyTree
+            The parameters.
+        opt_state : Any
+            The optimizer state.
+        multipliers : Any
+            The multipliers.
+        mu : Any
+            The penalty.
+
+        Returns
+        -------
+        Any
+            A ``_StepOut``.
+        """
+        data = self.problem.data_arrays()
+        return self._step(params, opt_state, multipliers, mu, data)
+
+    def measure(self, params: PyTree) -> tuple:
+        """Return ``(f, violation, defects, aux)`` at ``params``.
+
+        Parameters
+        ----------
+        params : PyTree
+            The parameters.
+
+        Returns
+        -------
+        tuple
+            The measurement.
+        """
+        return self._measure(params, self.problem.data_arrays())
+
+
+def _no_value_fn(_params: PyTree) -> Scalar:
+    """Refuse a line search's ``value_fn`` in the per-segment mode (traced).
+
+    Parameters
+    ----------
+    _params : PyTree
+        Unused.
+
+    Returns
+    -------
+    Scalar
+        Never returns.
+
+    Raises
+    ------
+    NotImplementedError
+        Always: the update program runs on one device and does not hold the
+        segments.
+    """
+    raise NotImplementedError(
+        "AugmentedLagrangian(devices=...) runs each segment in its own program, so "
+        "the optax update cannot evaluate the objective at trial points (value_fn): "
+        "use a rule without a line search (Adam, optax.lbfgs(linesearch=None))"
+    )
+
+
+class _PerSegment:
+    """The step as one program per segment plus one update program (``devices``).
+
+    Parameters
+    ----------
+    driver : AugmentedLagrangian
+        The driver (its optimizer).
+    problem : InferenceProblem
+        A problem that splits over its segments.
+    devices : Sequence[Any]
+        The devices.
+    """
+
+    def __init__(
+        self,
+        driver: AugmentedLagrangian,
+        problem: InferenceProblem,
+        devices: Sequence[Any],
+    ) -> None:
+        from mimirax.inference.parallel import ParallelSegmentObjective
+
+        self.objective = ParallelSegmentObjective(problem, devices)
+        rule = optax.with_extra_args_support(driver.optimizer)
+        objective = self.objective
+
+        def update(p, opt_state, contributions):
+            value, grads, f, defects = objective.assemble(p, contributions)
+            updates, opt_state = rule.update(
+                grads, opt_state, p, value=value, grad=grads, value_fn=_no_value_fn
+            )
+            return _StepOut(
+                params=_strong(optax.apply_updates(p, updates)),
+                opt_state=_strong(opt_state),
+                lagrangian=value,
+                objective=f,
+                violation=defect_violation((defects,)),
+                aux=None,
+            )
+
+        def measure(p, contributions):
+            f, defects = objective.assemble_forward(p, contributions)
+            return f, defect_violation((defects,)), (defects,)
+
+        self._update = jax.jit(update)
+        self._measure = jax.jit(measure)
+
+    @property
+    def num_traces(self) -> int:
+        """Return how many times a segment's value-and-gradient program was traced.
+
+        Returns
+        -------
+        int
+            The count.
+        """
+        return self.objective.num_traces
+
+    def defect_shapes(self, params: PyTree) -> tuple:
+        """Return the shapes of the defects, without tracing a segment.
+
+        Parameters
+        ----------
+        params : PyTree
+            The parameters.
+
+        Returns
+        -------
+        tuple
+            ``([S-1, N, 6],)``.
+        """
+        return self.objective.defect_shapes(params)
+
+    def place(self, tree: PyTree) -> PyTree:
+        """Return ``tree`` on the home device.
+
+        Parameters
+        ----------
+        tree : PyTree
+            Parameters or multipliers.
+
+        Returns
+        -------
+        PyTree
+            ``tree`` on ``devices[0]``.
+        """
+        return jax.device_put(tree, self.objective.home)
+
+    def refresh(self) -> None:
+        """Forget the segment programs an engine without keys may have changed."""
+        self.objective.refresh()
+
+    def step(self, params: PyTree, opt_state: Any, multipliers: Any, mu: Any) -> Any:
+        """Dispatch every segment, then the update on the home device.
+
+        Parameters
+        ----------
+        params : PyTree
+            The parameters.
+        opt_state : Any
+            The optimizer state.
+        multipliers : Any
+            The multipliers.
+        mu : Any
+            The penalty.
+
+        Returns
+        -------
+        Any
+            A ``_StepOut`` whose ``aux`` is the ``S`` segment auxes (each on its
+            segment's device).
+        """
+        contributions, auxes = self.objective.dispatch(params, multipliers, mu)
+        out = self._update(params, opt_state, contributions)
+        return out._replace(aux=auxes)
+
+    def measure(self, params: PyTree) -> tuple:
+        """Return ``(f, violation, defects, aux)`` at ``params``.
+
+        Parameters
+        ----------
+        params : PyTree
+            The parameters.
+
+        Returns
+        -------
+        tuple
+            The measurement; ``aux`` the segment auxes.
+        """
+        contributions, auxes = self.objective.dispatch_forward(params)
+        f, violation, defects = self._measure(params, contributions)
+        return f, violation, defects, auxes

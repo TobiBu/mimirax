@@ -36,6 +36,7 @@ from .inference import (  # noqa: E402
     MeanFieldVI,
     NelderMead,
     OptaxOptimizer,
+    ParallelSegmentObjective,
     ProblemEvaluation,
     adam,
     augmented_lagrangian_value,
@@ -89,6 +90,7 @@ from .shooting import (  # noqa: E402
     MultipleShootingForwardModel,
     SegmentEngine,
     SegmentResult,
+    SegmentSplit,
     ShootingEvaluation,
 )
 from .types import FitResult, SampleResult  # noqa: E402
@@ -127,6 +129,7 @@ __all__ = [
     "OptaxOptimizer",
     "Optimizer",
     "PRIORS",
+    "ParallelSegmentObjective",
     "Prior",
     "ProblemEvaluation",
     "ProjectedPositions",
@@ -137,6 +140,7 @@ __all__ = [
     "Sampler",
     "SegmentEngine",
     "SegmentResult",
+    "SegmentSplit",
     "ShootingEvaluation",
     "SoftplusTransform",
     "TimeAverage",

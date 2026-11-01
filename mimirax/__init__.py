@@ -34,6 +34,7 @@ from .inference import (  # noqa: E402
     MeanFieldVI,
     NelderMead,
     OptaxOptimizer,
+    ProblemEvaluation,
     adam,
     made_to_measure,
 )
@@ -121,6 +122,7 @@ __all__ = [
     "Optimizer",
     "PRIORS",
     "Prior",
+    "ProblemEvaluation",
     "ProjectedPositions",
     "REPARAMETERIZATIONS",
     "Registry",

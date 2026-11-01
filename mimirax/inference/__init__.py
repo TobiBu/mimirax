@@ -12,7 +12,7 @@ from mimirax._registry import Registry
 from mimirax.inference.derivative_free import NelderMead
 from mimirax.inference.hmc import HMC, NUTS
 from mimirax.inference.m2m import MadeToMeasure, made_to_measure
-from mimirax.inference.objective import InferenceProblem
+from mimirax.inference.objective import InferenceProblem, ProblemEvaluation
 from mimirax.inference.optimizers import OptaxOptimizer, adam
 from mimirax.inference.resampling import DataResampling
 from mimirax.inference.vi import MeanFieldVI
@@ -27,6 +27,7 @@ __all__ = [
     "MeanFieldVI",
     "NelderMead",
     "OptaxOptimizer",
+    "ProblemEvaluation",
     "adam",
     "made_to_measure",
 ]

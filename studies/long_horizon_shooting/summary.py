@@ -246,17 +246,22 @@ def recovery_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
             r.get("status") or ("converged" if r["converged"] else "budget")
             for r in rows
         ]
-        # passes until theta first came within the tolerance (the cost of the
-        # answer, before the driver's own stopping rule); single-shooting fits
-        # shorter than one history interval count their total
+        # passes after which theta stayed within the tolerance to the end (the
+        # cost of the answer, before the driver's own stopping rule); fits
+        # shorter than one history interval (25 steps) count their total
         to_tol = []
         for r, good in zip(rows, ok):
-            hits = [
-                h[1]
-                for h in r.get("history_steps_passes_maxerror") or []
-                if h[2] <= SUCCESS_TOL
-            ]
-            to_tol.append(hits[0] if hits else (r["segment_passes"] if good else None))
+            history = r.get("history_steps_passes_maxerror") or []
+            if not good or (not history and r.get("status") == "time limit"):
+                # failed, or stopped before progress histories were recorded
+                to_tol.append(None)
+                continue
+            since = r["segment_passes"]
+            for h in reversed(history):
+                if h[2] > SUCCESS_TOL:
+                    break
+                since = h[1]
+            to_tol.append(since)
         reached = [t for t in to_tol if t is not None]
         configs[f"{method}_S{s:02d}_r{radius:g}"] = {
             "method": method,
@@ -443,7 +448,7 @@ def figure(record: dict[str, Any]) -> Any:
         )
         if not rows:
             continue
-        s, rate, _ = (np.asarray(v) for v in zip(*rows))
+        s, rate, starts = (np.asarray(v) for v in zip(*rows))
         ax.plot(
             s * seg_lt,
             rate,
@@ -454,44 +459,49 @@ def figure(record: dict[str, Any]) -> Any:
             markersize=7,
             label=st["name"],
         )
+        for x, y, k in zip(s * seg_lt, rate, starts):
+            ax.annotate(
+                f"{round(y * k)}/{k}",
+                (x, y),
+                textcoords="offset points",
+                xytext=(5, -11 if kind == "single" else 4),
+                fontsize=7,
+                color="#555555",
+            )
     ax.set_ylim(-0.05, 1.05)
     ax.set_xlabel(r"horizon $T$ [Lyapunov times]")
     ax.set_ylabel("success rate (starts at $|\\delta\\theta| = 0.1$)")
-    ax.set_title("(e) recovery from perturbed starts", loc="left")
+    ax.set_title("(e) recovery from perturbed starts (successes/starts)", loc="left")
     ax.legend(frameon=False, fontsize=9)
 
-    # (f) cost
+    # (f) cost of a successful fit: passes until theta stayed within tolerance
     ax = axes[1, 2]
     for kind, st in METHOD_STYLE.items():
-        rows = sorted(
-            (
-                v["segments"],
-                v["segment_passes_median"],
-                v["segment_passes_min"],
-                v["segment_passes_max"],
-            )
-            for v in configs.values()
-            if v["method"] == kind and v["radius"] == 0.1
-        )
-        if not rows:
+        xs, ys = [], []
+        for v in configs.values():
+            if v["method"] != kind or v["radius"] != 0.1:
+                continue
+            for t in v["passes_to_tolerance_per_start"]:
+                if t is not None:
+                    xs.append(v["segments"] * seg_lt)
+                    ys.append(t)
+        if not xs:
             continue
-        s, med, lo, hi = (np.asarray(v) for v in zip(*rows))
-        ax.errorbar(
-            s * seg_lt,
-            med,
-            yerr=[med - lo, hi - med],
-            fmt=st["line"],
+        ax.scatter(
+            xs,
+            ys,
             marker=st["marker"],
+            s=36,
             color=st["colour"],
-            linewidth=2.0,
-            markersize=7,
-            capsize=3,
             label=st["name"],
+            alpha=0.85,
+            edgecolors="#FFFFFF",
+            linewidths=0.8,
         )
     ax.set_yscale("log")
     ax.set_xlabel(r"horizon $T$ [Lyapunov times]")
-    ax.set_ylabel("segment passes (value + gradient), median, range")
-    ax.set_title("(f) cost", loc="left")
+    ax.set_ylabel("segment passes until within tolerance")
+    ax.set_title("(f) cost of each successful fit", loc="left")
     ax.legend(frameon=False, fontsize=9)
 
     fig.suptitle(

@@ -35,6 +35,15 @@ JSON.
 |---|---|---|
 | `sensitivity_figure.py` | What do the data actually constrain, and which datum says so? | `results/sensitivity_figure.json`, `sensitivity_information_{light,dark}.{pdf,png}`, `sensitivity_information_map_{light,dark}.{pdf,png}` |
 | `fisher_fd_vs_ad.py` | Does a finite-difference Fisher matrix overstate what the data constrain? | `results/fisher_fd_vs_ad.json`, `fisher_fd_vs_ad.{pdf,png}` |
+| `long_horizon_shooting/` | When is multiple shooting worth its cost for N-body potential inference? | `results/long_horizon_shooting.json`, `long_horizon_shooting.{pdf,png}`; method and numbers in `long_horizon_shooting/README.md` |
+
+### `long_horizon_shooting/`
+
+The one study here that is several scripts: its measurements are long (GPU, resumable
+chunks, one result file per configuration under `$LONG_HORIZON_RUNS`), so `lyapunov.py`,
+`roughness.py` and `recovery.py` write the per-configuration files and `summary.py` builds
+the JSON and the figure from them. It needs `mimirax[jaccpot]` and a nornax with
+`nornax.potentials`. Its own `README.md` has the method, the numbers and the conclusion.
 
 ### `sensitivity_figure.py`
 

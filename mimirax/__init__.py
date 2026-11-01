@@ -80,6 +80,12 @@ from .protocols import (  # noqa: E402
     Reparameterization,
     Sampler,
 )
+from .shooting import (  # noqa: E402
+    MultipleShootingForwardModel,
+    SegmentEngine,
+    SegmentResult,
+    ShootingEvaluation,
+)
 from .types import FitResult, SampleResult  # noqa: E402
 
 __all__ = [
@@ -106,6 +112,7 @@ __all__ = [
     "METHODS",
     "MadeToMeasure",
     "MeanFieldVI",
+    "MultipleShootingForwardModel",
     "NUTS",
     "NelderMead",
     "OBSERVABLES",
@@ -120,6 +127,9 @@ __all__ = [
     "Reparameterization",
     "SampleResult",
     "Sampler",
+    "SegmentEngine",
+    "SegmentResult",
+    "ShootingEvaluation",
     "SoftplusTransform",
     "TimeAverage",
     "TotalMassConstraint",

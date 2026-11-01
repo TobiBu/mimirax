@@ -50,8 +50,12 @@ in both modes. Two differences: :attr:`AugmentedLagrangianResult.num_traces`
 counts the segment programs' traces (one per segment key: equal direct-sum
 segments share one), and an optax rule that calls ``value_fn`` (``optax.lbfgs()``
 with its default zoom line search) is refused -- a line search needs the whole
-objective inside the update program; ``optax.lbfgs(linesearch=None)`` and Adam
-work.
+objective inside the update program. Adam works; for L-BFGS take
+``optax.lbfgs(linesearch=None)`` with :attr:`AugmentedLagrangian.line_search`
+``"backtracking"``: an Armijo backtracking on the HOST, each trial point one
+parallel forward pass of the segments, its verdict checked (a failed trial is
+rejected like a too-long step, and its segments are re-planned at the next
+``prepare``).
 """
 
 from __future__ import annotations
@@ -329,6 +333,16 @@ class AugmentedLagrangian:
         len(devices)]``, the parameters, the optimizer state and the sum on
         ``devices[0]`` (module docstring). The problem must split over its
         segments, or :meth:`minimize` raises.
+    line_search : Optional[str]
+        ``None`` (default): the optimizer's update is the step. ``"backtracking"``
+        (with :attr:`devices` only): the update is a DIRECTION, scaled on the host
+        by Armijo backtracking (``L(p + a d) <= L(p) + c1 a g.d``, ``a`` halved
+        from 1 up to :attr:`line_search_steps` times; no step when none passes),
+        every trial a parallel forward pass. For ``optax.lbfgs(linesearch=None)``.
+    line_search_steps : int
+        Maximum trial points per step.
+    line_search_c1 : float
+        Armijo's sufficient-decrease constant.
     """
 
     optimizer: optax.GradientTransformation = field(
@@ -346,6 +360,9 @@ class AugmentedLagrangian:
     shrink: float = 0.25
     max_redo: int = 3
     devices: Optional[Sequence[Any]] = None
+    line_search: Optional[str] = None
+    line_search_steps: int = 20
+    line_search_c1: float = 1.0e-4
 
     def _compile(
         self, problem: InferenceProblem, counter: list[int]
@@ -420,8 +437,22 @@ class AugmentedLagrangian:
         -------
         Any
             A :class:`_OneProgram` (``devices=None``) or a :class:`_PerSegment`.
+
+        Raises
+        ------
+        ValueError
+            For an unknown :attr:`line_search`, or one without :attr:`devices`.
         """
+        if self.line_search not in (None, "backtracking"):
+            raise ValueError(
+                f"line_search must be None or 'backtracking', got {self.line_search!r}"
+            )
         if self.devices is None:
+            if self.line_search is not None:
+                raise ValueError(
+                    "line_search runs in the per-segment mode only (devices=...); in "
+                    "one program use the optax rule's own (optax.lbfgs())"
+                )
             return _OneProgram(self, problem)
         return _PerSegment(self, problem, self.devices)
 
@@ -496,6 +527,7 @@ class AugmentedLagrangian:
                     _host_prepare(forward, params)
                     evaluator.refresh()
                     out = evaluator.step(params, opt_state, multipliers, mu_array)
+                out = evaluator.accept(out)
                 value = float(out.lagrangian)
                 trace["objective"].append(float(out.objective))
                 trace["violation"].append(float(out.violation))
@@ -636,6 +668,21 @@ class _OneProgram:
         data = self.problem.data_arrays()
         return self._step(params, opt_state, multipliers, mu, data)
 
+    def accept(self, out: Any) -> Any:
+        """Return the checked step unchanged (the optimizer's update is the step).
+
+        Parameters
+        ----------
+        out : Any
+            The step's ``_StepOut``.
+
+        Returns
+        -------
+        Any
+            ``out``.
+        """
+        return out
+
     def measure(self, params: PyTree) -> tuple:
         """Return ``(f, violation, defects, aux)`` at ``params``.
 
@@ -700,6 +747,15 @@ class _PerSegment:
         from mimirax.inference.parallel import ParallelSegmentObjective
 
         self.objective = ParallelSegmentObjective(problem, devices)
+        self.forward = problem.forward
+        self.line_search = driver.line_search
+        self.line_search_steps = int(driver.line_search_steps)
+        self.line_search_c1 = float(driver.line_search_c1)
+        #: the last step's base point, direction and slope (line search)
+        self._pending: Any = None
+        #: trial points evaluated and rejected by the line search
+        self.trials = 0
+        self.rejected = 0
         rule = optax.with_extra_args_support(driver.optimizer)
         objective = self.objective
 
@@ -708,21 +764,46 @@ class _PerSegment:
             updates, opt_state = rule.update(
                 grads, opt_state, p, value=value, grad=grads, value_fn=_no_value_fn
             )
-            return _StepOut(
-                params=_strong(optax.apply_updates(p, updates)),
-                opt_state=_strong(opt_state),
-                lagrangian=value,
-                objective=f,
-                violation=defect_violation((defects,)),
-                aux=None,
+            slope = sum(
+                jnp.sum(g * u)
+                for g, u in zip(
+                    jax.tree_util.tree_leaves(grads), jax.tree_util.tree_leaves(updates)
+                )
+            )
+            return (
+                _StepOut(
+                    params=_strong(optax.apply_updates(p, updates)),
+                    opt_state=_strong(opt_state),
+                    lagrangian=value,
+                    objective=f,
+                    violation=defect_violation((defects,)),
+                    aux=None,
+                ),
+                updates,
+                slope,
             )
 
         def measure(p, contributions):
             f, defects = objective.assemble_forward(p, contributions)
             return f, defect_violation((defects,)), (defects,)
 
+        def trial(p, updates, alpha):
+            scaled = jax.tree_util.tree_map(lambda u: alpha * u, updates)
+            return _strong(optax.apply_updates(p, scaled))
+
+        def lagrangian_at(p, contributions, multipliers, mu):
+            f, defects = objective.assemble_forward(p, contributions)
+            value = f
+            for lam, defect in zip(multipliers, (defects,)):
+                value = (
+                    value + jnp.sum(lam * defect) + 0.5 * mu * jnp.sum(defect * defect)
+                )
+            return value
+
         self._update = jax.jit(update)
         self._measure = jax.jit(measure)
+        self._trial = jax.jit(trial)
+        self._lagrangian_at = jax.jit(lagrangian_at)
 
     @property
     def num_traces(self) -> int:
@@ -790,8 +871,50 @@ class _PerSegment:
             segment's device).
         """
         contributions, auxes = self.objective.dispatch(params, multipliers, mu)
-        out = self._update(params, opt_state, contributions)
+        out, updates, slope = self._update(params, opt_state, contributions)
+        self._pending = (params, updates, slope, multipliers, mu)
         return out._replace(aux=auxes)
+
+    def accept(self, out: Any) -> Any:
+        """Scale the checked step by the host line search, when there is one.
+
+        Armijo backtracking from ``a = 1`` (:attr:`AugmentedLagrangian.line_search`):
+        each trial point is one parallel forward pass of the segments, checked by
+        the forward model's ``check``; a failed check rejects the trial (the
+        engine re-plans those segments at the next ``prepare``). With no trial
+        accepted the parameters stay where they were.
+
+        Parameters
+        ----------
+        out : Any
+            The step's ``_StepOut`` (its verdict checked).
+
+        Returns
+        -------
+        Any
+            ``out`` with the accepted parameters.
+        """
+        if self.line_search is None:
+            return out
+        params, updates, slope, multipliers, mu = self._pending
+        value, slope = float(out.lagrangian), float(slope)
+        alpha = 1.0
+        for _ in range(self.line_search_steps):
+            candidate = self._trial(params, updates, alpha)
+            contributions, auxes = self.objective.dispatch_forward(candidate)
+            trial_value = float(
+                self._lagrangian_at(candidate, contributions, multipliers, mu)
+            )
+            self.trials += 1
+            if (
+                _host_check(self.forward, auxes)
+                and math.isfinite(trial_value)
+                and trial_value <= value + self.line_search_c1 * alpha * slope
+            ):
+                return out._replace(params=candidate)
+            self.rejected += 1
+            alpha *= 0.5
+        return out._replace(params=params)
 
     def measure(self, params: PyTree) -> tuple:
         """Return ``(f, violation, defects, aux)`` at ``params``.

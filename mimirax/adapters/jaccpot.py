@@ -48,10 +48,27 @@ augmented-Lagrangian driver builds its step again).
 :attr:`~FusedSegmentEngine.generation` counts the plans made, and
 :meth:`~FusedSegmentEngine.check` refuses the aux of a program traced on a
 replaced plan.
+
+ONE PROGRAM PER SEGMENT, ONE DEVICE EACH (S10 session 2). A segment's program
+(``mimirax.inference.parallel``) is keyed by
+:meth:`~FusedSegmentEngine.segment_key` -- the segment and its plan's id -- so a
+re-plan retraces that segment's program alone. A plan's arrays (its traced
+``dt`` / force parameters and every runner segment's f_b seed;
+:meth:`~FusedSegmentEngine.segment_arrays`) are placed on the segment's device
+once per plan and passed to the program as ARGUMENTS (``__call__(...,
+arrays=)``): without them the seeds, ``[N]`` each, are constants embedded in the
+program. Everything else a ``jaccpot.production_grad.GradientPlan`` holds is host
+data or Python statics (the providers hold no device buffer, the segment plans are
+ints and dicts, the start state and seeds are numpy), so the pre-pass may run on
+any device -- it runs on the default one -- and the program compiles for the
+device its arguments are on. The pre-pass's ``forward`` (the runner's handle: the
+last accelerations and the provider on the pre-pass's device) is the one device
+payload, and it is dropped unless ``keep_forward``.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import inspect
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -365,6 +382,24 @@ class DirectSumSegmentEngine:
             theta, positions, velocities, masses, self.segment_steps[segment]
         )
 
+    def segment_key(self, segment: int) -> tuple:
+        """Return the key of segment ``segment`` 's program: its length.
+
+        Segments of equal length are the same function of their inputs, so one
+        traced program serves them all (:func:`mimirax.shooting.segment_key`).
+
+        Parameters
+        ----------
+        segment : int
+            The segment.
+
+        Returns
+        -------
+        tuple
+            ``("direct_sum", segment_steps[segment])``.
+        """
+        return ("direct_sum", int(self.segment_steps[segment]))
+
 
 # ---------------------------------------------------------------------------
 # The fused production lane (S10, track J).
@@ -540,6 +575,8 @@ class FusedSegmentEngine:
         self._plan_ids: list = [-1] * len(steps)
         #: segments to plan at the next prepare
         self._stale: set = set(range(len(steps)))
+        #: each plan's arrays placed on a device, by (segment, plan id, device)
+        self._placed: dict = {}
         # jaccpot's opt-in cache of the pre-pass's freeze program (compiled once per
         # compile key across this engine's pre-passes, not once per pre-pass),
         # where the runner offers it
@@ -622,6 +659,9 @@ class FusedSegmentEngine:
         self.plans[segment] = plan
         self.generation += 1
         self._plan_ids[segment] = self.generation
+        # the replaced plan's placed arrays are dead
+        for key in [key for key in self._placed if key[0] == segment]:
+            del self._placed[key]
 
     def prepare(self, theta: PyTree, nodes: Any, masses: PerParticle) -> None:
         """Plan the segments without a valid plan, at their current nodes. Host.
@@ -694,6 +734,129 @@ class FusedSegmentEngine:
     # Traced: one segment's gradient run.
     # ------------------------------------------------------------------
 
+    def segment_key(self, segment: int) -> tuple:
+        """Return the key of segment ``segment`` 's program: the segment and its plan.
+
+        A re-plan changes the key, so a driver keying its programs by it traces
+        again exactly the re-planned segments (:func:`mimirax.shooting.segment_key`).
+
+        Parameters
+        ----------
+        segment : int
+            The segment.
+
+        Returns
+        -------
+        tuple
+            ``("fused", segment, plan id)`` (plan id ``-1`` before a plan).
+        """
+        return ("fused", int(segment), int(self._plan_ids[segment]))
+
+    @staticmethod
+    def _plan_parameters(plan: Any) -> dict:
+        """The plan's parameters the gradient run reads, the field's excepted.
+
+        Parameters
+        ----------
+        plan : Any
+            A ``GradientPlan``.
+
+        Returns
+        -------
+        dict
+            ``{"dt", "force_params"}`` as the runner passed them.
+        """
+        return {"dt": plan.params["dt"], "force_params": plan.params["force_params"]}
+
+    def segment_arrays(self, segment: int, device: Any = None) -> Any:
+        """Return segment ``segment`` 's plan arrays, placed on ``device``. Host.
+
+        The plan's array parameters (``dt`` and the force parameters, when the
+        runner traces them; a Python number stays a literal, ``None`` here) and
+        every runner segment's f_b seed (``None`` without ``dehnen_error``), for a
+        program to take as arguments (``__call__(..., arrays=)``). Placed once per
+        plan and device (cached; dropped when the segment is re-planned).
+
+        Parameters
+        ----------
+        segment : int
+            The segment.
+        device : Any
+            Where to place them; ``None``: the default device.
+
+        Returns
+        -------
+        Any
+            ``{"params": tuple, "seeds": tuple}``, or ``None`` before the
+            segment's first plan.
+        """
+        plan = self.plans[segment]
+        if plan is None:
+            return None
+        key = (int(segment), self._plan_ids[segment], device)
+        placed = self._placed.get(key)
+        if placed is None:
+            leaves = jax.tree_util.tree_leaves(self._plan_parameters(plan))
+            host = {
+                "params": tuple(
+                    leaf if isinstance(leaf, (jax.Array, np.ndarray)) else None
+                    for leaf in leaves
+                ),
+                "seeds": tuple(
+                    getattr(seg, "seed", None) for seg in getattr(plan, "segments", ())
+                ),
+            }
+            placed = (
+                jax.tree_util.tree_map(jnp.asarray, host)
+                if device is None
+                else jax.device_put(host, device)
+            )
+            self._placed[key] = placed
+        return placed
+
+    def _bind(self, plan: Any, arrays: Any) -> tuple:
+        """The plan with ``arrays`` in place of its own, and its parameters. Traced.
+
+        Parameters
+        ----------
+        plan : Any
+            The segment's ``GradientPlan``.
+        arrays : Any
+            What :meth:`segment_arrays` returned for it (or tracers of it).
+
+        Returns
+        -------
+        tuple
+            ``(plan, params)``: a shallow copy of the plan whose runner segments'
+            seeds are ``arrays["seeds"]``, and its ``dt`` / force parameters with
+            the array leaves from ``arrays["params"]``.
+
+        Raises
+        ------
+        ValueError
+            If ``arrays`` do not match the plan (taken from another plan).
+        """
+        own = self._plan_parameters(plan)
+        leaves, treedef = jax.tree_util.tree_flatten(own)
+        given = arrays["params"]
+        segments = tuple(getattr(plan, "segments", ()))
+        if len(given) != len(leaves) or len(arrays["seeds"]) != len(segments):
+            raise ValueError(
+                "segment arrays do not match the segment's plan: take them from "
+                "segment_arrays() after the last prepare"
+            )
+        params = jax.tree_util.tree_unflatten(
+            treedef,
+            [leaf if new is None else new for leaf, new in zip(leaves, given)],
+        )
+        if not segments:
+            return plan, params
+        segments = tuple(
+            dataclasses.replace(seg, seed=seed)
+            for seg, seed in zip(segments, arrays["seeds"])
+        )
+        return dataclasses.replace(plan, segments=segments), params
+
     def __call__(
         self,
         theta: PyTree,
@@ -701,6 +864,7 @@ class FusedSegmentEngine:
         velocities: Vec3,
         masses: PerParticle,
         segment: int,
+        arrays: Any = None,
     ) -> SegmentResult:
         """Run segment ``segment`` on its plan from the given state. Traced.
 
@@ -724,6 +888,10 @@ class FusedSegmentEngine:
             ``(n,)`` masses (differentiated when the caller frees them).
         segment : int
             Which segment (a Python int: each segment is its own program part).
+        arrays : Any
+            The plan's arrays as :meth:`segment_arrays` returned them (or the
+            program's arguments of them): read instead of the plan's own, which
+            are otherwise constants of the program. ``None``: the plan's.
 
         Returns
         -------
@@ -777,8 +945,12 @@ class FusedSegmentEngine:
                 tree,
             )
 
+        params = plan.params
+        if arrays is not None:
+            plan, own = self._bind(plan, arrays)
+            params = {**params, **own}
         inputs = {
-            **opaque(plan.params),
+            **opaque(params),
             "positions": opaque(positions),
             "velocities": opaque(velocities),
             "masses": opaque(masses),

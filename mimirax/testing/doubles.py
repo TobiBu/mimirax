@@ -14,13 +14,19 @@ finite differences whose tolerance has to be argued for.
   ``d a / d x = -G sum_j m_j [ I / r^3 - 3 d d^T / r^5 ]`` in closed form.
 * :class:`DirectSumGravity` -- self-gravity of ``n`` bodies, the honest
   ``O(n^2)`` :class:`~mimirax.protocols.ForceModel` any FMM is checked against.
+* :class:`VerletSegmentEngine` -- a pure-JAX
+  :class:`~mimirax.shooting.SegmentEngine` (velocity Verlet over
+  :class:`DirectSumGravity` plus a parameterized field), so multiple shooting is
+  testable with no solver installed.
 
 All are float64-exact to round-off; tests compare at ``atol = 1e-12``.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -30,11 +36,13 @@ from mimirax._typing import PerParticle, PyTree, Vec3
 from mimirax.inference.objective import InferenceProblem
 from mimirax.likelihoods import GaussianLikelihood
 from mimirax.observables import IdentityObservable
+from mimirax.shooting import SegmentResult
 
 __all__ = [
     "DirectSumGravity",
     "LinearForwardModel",
     "SoftenedPointMassField",
+    "VerletSegmentEngine",
     "make_linear_problem",
 ]
 
@@ -282,3 +290,161 @@ def make_linear_problem(
         observed=observed,
     )
     return problem, truth
+
+
+@dataclass(frozen=True)
+class VerletSegmentEngine:
+    """A pure-JAX :class:`~mimirax.shooting.SegmentEngine`: velocity Verlet, no solver.
+
+    The double the multiple-shooting core is tested on without jaccpot. Each
+    segment computes its start force, then runs ``segment_steps[segment]``
+    steps of the velocity Verlet jaccpot's rollouts write (drift ``x + v dt +
+    a dt^2 / 2``, force, kick ``v + (a + a') dt / 2``) in a ``lax.scan``, over
+    :class:`DirectSumGravity` plus an optional external field in nornax's
+    ``f(x, t, args)`` convention (evaluated at ``t = 0``) whose parameters are
+    ``theta``. Differentiated by plain autodiff.
+
+    With :attr:`vjp_only` the segment is a ``jax.custom_vjp`` (its backward is
+    the plain VJP), so any forward-mode differentiation through it raises --
+    the property jaccpot's checkpointed rollouts have, made available to tests
+    that guard a VJP-only path.
+
+    Attributes
+    ----------
+    segment_steps : tuple[int, ...]
+        Steps per segment.
+    dt : float
+        The timestep.
+    field : Callable[[Array, Any, Any], Array] | None
+        ``field(positions, t, theta) -> [N, 3]``, or ``None``.
+    softening : float
+        Plummer softening of the self-gravity.
+    gravitational_constant : float
+        ``G`` of the self-gravity; ``0`` switches it off.
+    vjp_only : bool
+        Wrap each segment in a ``custom_vjp``.
+    """
+
+    segment_steps: tuple[int, ...]
+    dt: float
+    field: Callable[[Array, Any, Any], Array] | None = None
+    softening: float = 0.1
+    gravitational_constant: float = 1.0
+    vjp_only: bool = False
+
+    def _acceleration(self, theta: PyTree, positions: Array, masses: Array) -> Array:
+        """Return the self-gravity plus the field at ``positions``.
+
+        Parameters
+        ----------
+        theta : PyTree
+            The field's parameters.
+        positions : Array
+            ``[N, 3]`` positions.
+        masses : Array
+            ``[N]`` masses.
+
+        Returns
+        -------
+        Array
+            ``[N, 3]`` accelerations.
+        """
+        acc = jnp.zeros_like(positions)
+        if self.gravitational_constant != 0.0:
+            gravity = DirectSumGravity(self.softening, self.gravitational_constant)
+            acc = gravity.accelerations(positions, masses)
+        if self.field is not None:
+            acc = acc + self.field(positions, 0.0, theta)
+        return acc
+
+    def _segment(
+        self,
+        theta: PyTree,
+        positions: Array,
+        velocities: Array,
+        masses: Array,
+        num_steps: int,
+    ) -> tuple[Array, Array]:
+        """Run ``num_steps`` velocity-Verlet steps.
+
+        Parameters
+        ----------
+        theta : PyTree
+            The field's parameters.
+        positions : Array
+            ``[N, 3]`` start positions.
+        velocities : Array
+            ``[N, 3]`` start velocities.
+        masses : Array
+            ``[N]`` masses.
+        num_steps : int
+            Steps. Static.
+
+        Returns
+        -------
+        tuple[Array, Array]
+            The end positions and velocities.
+        """
+        dt = self.dt
+
+        def step(carry, _):
+            x, v, a = carry
+            x = x + v * dt + 0.5 * a * dt**2
+            a_new = self._acceleration(theta, x, masses)
+            v = v + 0.5 * (a + a_new) * dt
+            return (x, v, a_new), None
+
+        a0 = self._acceleration(theta, positions, masses)
+        (x, v, _), _ = jax.lax.scan(
+            step, (positions, velocities, a0), None, length=num_steps
+        )
+        return x, v
+
+    def __call__(
+        self,
+        theta: PyTree,
+        positions: Array,
+        velocities: Array,
+        masses: Array,
+        segment: int,
+    ) -> SegmentResult:
+        """Run segment ``segment``.
+
+        Parameters
+        ----------
+        theta : PyTree
+            The field's parameters.
+        positions : Array
+            ``[N, 3]`` start positions.
+        velocities : Array
+            ``[N, 3]`` start velocities.
+        masses : Array
+            ``[N]`` masses.
+        segment : int
+            Which segment. Static.
+
+        Returns
+        -------
+        SegmentResult
+            The end state; the aux is ``None``.
+        """
+        num_steps = int(self.segment_steps[segment])
+        if not self.vjp_only:
+            x, v = self._segment(theta, positions, velocities, masses, num_steps)
+            return SegmentResult(x, v, None)
+
+        def run(th, x0, v0, m):
+            return self._segment(th, x0, v0, m, num_steps)
+
+        guarded = jax.custom_vjp(run)
+
+        def guarded_fwd(th, x0, v0, m):
+            out, pullback = jax.vjp(run, th, x0, v0, m)
+            return out, pullback
+
+        def guarded_bwd(pullback, cotangent):
+            return pullback(cotangent)
+
+        guarded.defvjp(guarded_fwd, guarded_bwd)
+        x, v = guarded(theta, positions, velocities, masses)
+        return SegmentResult(x, v, None)

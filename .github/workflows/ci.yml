@@ -90,7 +90,9 @@ jobs:
       JAX_PLATFORMS: cpu
       YGGDRAX_REF: cfc0e7351e2291099c515ce7f7deb50737faf3c8
       JACCPOT_REF: 342d75f9287ebfa80846b1d7b6dbb82804adaf2b
-      NORNAX_REF: f67d4048bfe9ded790952038a1e7482e5da1c350
+      # nornax s10/shooting-potentials (on top of PR #22): nornax.potentials and
+      # shooting_node on a RebuildingForceModel
+      NORNAX_REF: 48479ae751bcb970de765d2c87eaedb89075185c
 
     steps:
       - name: Checkout
@@ -120,6 +122,7 @@ jobs:
           pytest -o addopts="" --no-header -q
           tests/unit/test_shooting.py
           tests/integration/test_multiple_shooting.py
+          tests/integration/test_shooting_galaxy_potentials.py
 
       - name: The same under runtime type-checking (jaxtyping + beartype)
         env:
@@ -129,3 +132,4 @@ jobs:
           pytest -o addopts="" --no-header -q
           tests/unit/test_shooting.py
           tests/integration/test_multiple_shooting.py
+          tests/integration/test_shooting_galaxy_potentials.py

@@ -126,6 +126,7 @@ jobs:
           tests/integration/test_multiple_shooting.py
           tests/integration/test_parallel_segments.py
           tests/integration/test_shooting_galaxy_potentials.py
+          tests/integration/test_long_horizon_shooting.py
 
       - name: The same under runtime type-checking (jaxtyping + beartype)
         env:
@@ -138,3 +139,4 @@ jobs:
           tests/integration/test_multiple_shooting.py
           tests/integration/test_parallel_segments.py
           tests/integration/test_shooting_galaxy_potentials.py
+          tests/integration/test_long_horizon_shooting.py

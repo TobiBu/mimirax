@@ -12,7 +12,8 @@ of 83 steps) single shooting is the right tool up to ~8 Lyapunov times: one smoo
 across a 10 % window, 10/10 recoveries in ~450 segment passes, 8-10x cheaper than multiple
 shooting. Between 8 and 10 Lyapunov times its objective turns rough -- the gradient grows
 like `exp(lambda T)`, dozens of spurious minima appear, the true basin shrinks to ~1e-4 --
-and its success falls to 7/10, 3/10 and 0/10 at 9.7, 11.6 and 15.5 Lyapunov times. There,
+and its success falls to 7/10 and 3/10 at 9.7 and 11.6 Lyapunov times and to none of 8
+finished fits at 15.5. There,
 multiple shooting with nodes initialised from the observed states recovers the halo (3/3 at
 each horizon, theta within 4e-4) at 5,000-13,000 passes per fit; with nodes propagated from
 the initial guess it fails like single shooting (0/6). Multiple shooting is worth its cost
@@ -185,14 +186,15 @@ fit's progress history, every 25 inner steps). That reading favours multiple sho
 | 4 | 7.7 | 10/10, 396-480 (2.6e-6) | 2/3 at the 14-min cap, 3792 / 4600 (1.4e-4, 5.5e-4; k1 at 1.4e-3) | -- |
 | 5 | 9.7 | 7/10, 670-1015 (one 11250) | 3/3 on single's 3 FAILED starts, 5020-6880 (2.2e-4-3.5e-4) | -- |
 | 6 | 11.6 | 3/10, 1338 / 4560 / 8550 | 3/3, 6048 / 7992 / (k0 before histories: within 2.1e-4 by 7536) | 0/3, 0.074-0.078 at ~4900 |
-| 8 | 15.5 | 0/10 (ends 0.044-0.22, one 5.5) | 3/3 at the 40-min cap, 6640 / 8088 / 13408 (9.2e-5-2.0e-4 at ~31000) | 0/3, 0.095-0.17 at ~4800; pilot 0.046 after the full budget (65328) |
+| 8 | 15.5 | 0/8 finished (ends 0.044-0.22); 2 unfinished: k1 at 5.5 after 30400 passes, k9 at 0.044 when cut at 4224 | 3/3 at the 40-min cap, 6640 / 8088 / 13408 (9.2e-5-2.0e-4 at ~31000) | 0/3, 0.095-0.17 at ~4800; pilot 0.046 after the full budget (65328) |
 
 Errors in brackets are `max |theta - theta*|` at the end. "Passes per success" for single
 shooting is its driver's full run. Medians of the inner steps per fit: single 20 / 24 / 34
 / 41 / 54 at S 2-8; multiple_data 600 / 625 / 2450 / 1825 (the caps, not convergence).
 
 * **Single shooting collapses where the landscape does.** 10/10 at 3.9 and 7.7 Lyapunov
-  times, 7/10 at 9.7, 3/10 at 11.6, 0/10 at 15.5. Its failures stop in wrong minima
+  times, 7/10 at 9.7, 3/10 at 11.6, 0 of 8 finished at 15.5 (two more unfinished, both off
+  the truth when they stopped). Its failures stop in wrong minima
   0.04-0.1 from the truth (the driver "converges": the objective is stagnant there, 1e8-3e9
   above its value at the truth); two S 8 starts wandered (log M off by 5.5 at k = 1) while
   the line search failed step after step. Started AT the truth, S 8 single shooting
@@ -200,7 +202,7 @@ shooting is its driver's full run. Medians of the inner steps per fit: single 20
   gradient of ~1e12 and a basin ~1e-4 wide, no line search finds a decrease.
 * **Multiple shooting from the data holds there.** 3/3 at 9.7 Lyapunov times on the three starts single
   shooting failed on, 3/3 at 11.6 and 3/3 at 15.5 (theta within 0.9-2.0e-4 of the truth at
-  the cap), where single shooting has 3/10 and 0/10. It needs 5000-13400 passes to settle
+  the cap), where single shooting has 3/10 and 0 of 8 finished. It needs 5000-13400 passes to settle
   within 1e-3 -- 5-10x the passes of a successful single-shooting fit at S 5 -- and its
   defects were still above the 1e-8 tolerance at every cap: the driver had not finished.
   Its landscape explains why it holds: section 2's slice has one minimum and a basin as
@@ -230,7 +232,7 @@ rough, and only if its nodes start near the trajectory.** Measured on this syste
    83 steps at softening 0.05 a). The single-shot gradient grows as `exp(lambda T)`
    (1.7 e-folds per 1.94-Lyapunov-time segment), spurious minima appear between 7.7 and 9.7
    Lyapunov times (1 -> 6 -> 46 -> 93 at S 4-8), the true basin shrinks from >= 0.1 to
-   2e-3 and then ~1e-4, and single shooting's success falls 10/10 -> 7/10 -> 3/10 -> 0/10.
+   2e-3 and then ~1e-4, and single shooting's success falls 10/10 -> 7/10 -> 3/10 -> 0/8 (finished fits).
    From 16 Lyapunov times even a start AT the truth leaves the basin.
 3. **Beyond it, multiple shooting from data-initialised nodes recovers** (3/3 at 9.7, 11.6
    and 15.5 Lyapunov times), at 5,000-13,000 segment passes per fit -- far more than a

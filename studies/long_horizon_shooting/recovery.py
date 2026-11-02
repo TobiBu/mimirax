@@ -106,7 +106,9 @@ def _state_paths(state_path: Path) -> tuple[Path, Path]:
     tuple[Path, Path]
         ``(<...>.npz, <...>.json)``.
     """
-    return state_path.with_suffix(".state.npz"), state_path.with_suffix(".state.json")
+    # not with_suffix: the radius in the name ("_r0.1_") holds a dot
+    folder, name = state_path.parent, state_path.name
+    return folder / f"{name}.state.npz", folder / f"{name}.state.json"
 
 
 def save_state(
@@ -135,7 +137,7 @@ def save_state(
     leaves = jax.tree_util.tree_leaves(
         (state.params, state.opt_state, state.multipliers)
     )
-    tmp = npz.with_suffix(f".{os.getpid()}.tmp.npz")
+    tmp = npz.parent / f"{npz.name}.{os.getpid()}.tmp.npz"
     np.savez(tmp, *[np.asarray(leaf) for leaf in leaves])
     tmp.replace(npz)
     c.write_json(
@@ -609,7 +611,7 @@ def run_one(
         theta0,
         partial,
         60.0 * cap_min,
-        state_path=partial.with_suffix(""),
+        state_path=partial.parent / path.stem,
         deadline=deadline,
     )
     final = np.asarray(record["theta"])

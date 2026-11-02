@@ -510,6 +510,14 @@ class FusedSegmentEngine:
         ``"nested"``, ``"offload"``, or ``None`` for a plain scan).
     inner_steps : Optional[int]
         Its ``inner_steps`` (``"nested"``).
+    start_force : str
+        Where each segment's start force runs, jaccpot's
+        ``GradientPlan.rollout(start_force=...)``: ``"outside"`` (default) beside
+        the segment's rollout, the forward the runner's bit for bit; ``"adjoint"``
+        inside its hand-written reverse, for less device memory (W at the S9 2e6
+        Plummer calibration 883 -> ~406 B/p), step 0's field then added inside the
+        program (an ulp off the runner's eager add for a field of more than one
+        multiply). Needs a jaccpot with the argument.
     keep_forward : bool
         Keep each plan's pre-pass result (its ``forward``: the end state and the
         runner's handle) instead of only the end state (:attr:`ends`). For tests.
@@ -535,7 +543,8 @@ class FusedSegmentEngine:
     Raises
     ------
     ValueError
-        If ``segment_steps`` is empty or holds a length below 1.
+        If ``segment_steps`` is empty or holds a length below 1, or
+        ``start_force`` is unknown.
     """
 
     plans: list
@@ -553,17 +562,23 @@ class FusedSegmentEngine:
         force_params: Any = None,
         checkpoint: Optional[str] = "step",
         inner_steps: Optional[int] = None,
+        start_force: str = "outside",
         keep_forward: bool = False,
     ) -> None:
         steps = tuple(int(s) for s in segment_steps)
         if not steps or min(steps) < 1:
             raise ValueError(f"segment_steps must be positive, got {steps}")
+        if start_force not in ("outside", "adjoint"):
+            raise ValueError(
+                f"start_force must be 'outside' or 'adjoint', got {start_force!r}"
+            )
         self.runner = runner
         self.segment_steps = steps
         self.dt = dt
         self.force_params = force_params
         self.checkpoint = checkpoint
         self.inner_steps = inner_steps
+        self.start_force = start_force
         self.keep_forward = bool(keep_forward)
         self.plans: list = [None] * len(steps)
         self.ends: list = [None] * len(steps)
@@ -775,7 +790,9 @@ class FusedSegmentEngine:
         runner traces them; a Python number stays a literal, ``None`` here) and
         every runner segment's f_b seed (``None`` without ``dehnen_error``), for a
         program to take as arguments (``__call__(..., arrays=)``). Placed once per
-        plan and device (cached; dropped when the segment is re-planned).
+        plan and device (cached; dropped when the segment is re-planned). They are
+        jaccpot's ``GradientPlan.arrays(device)``, where the plan has it (then
+        ``boundary`` too, ``None``: a segment is a fresh run from its node).
 
         Parameters
         ----------
@@ -787,15 +804,20 @@ class FusedSegmentEngine:
         Returns
         -------
         Any
-            ``{"params": tuple, "seeds": tuple}``, or ``None`` before the
-            segment's first plan.
+            ``{"params": tuple, "seeds": tuple}`` (and ``"boundary"`` from
+            jaccpot's ``GradientPlan.arrays``), or ``None`` before the segment's
+            first plan.
         """
         plan = self.plans[segment]
         if plan is None:
             return None
         key = (int(segment), self._plan_ids[segment], device)
         placed = self._placed.get(key)
-        if placed is None:
+        if placed is None and hasattr(plan, "arrays"):
+            placed = plan.arrays(device)
+            self._placed[key] = placed
+        elif placed is None:
+            # a jaccpot before GradientPlan.arrays: the same data, gathered here
             leaves = jax.tree_util.tree_leaves(self._plan_parameters(plan))
             host = {
                 "params": tuple(
@@ -946,7 +968,14 @@ class FusedSegmentEngine:
             )
 
         params = plan.params
-        if arrays is not None:
+        bound: dict = {}
+        if arrays is not None and hasattr(plan, "arrays"):
+            # jaccpot binds them (GradientPlan.rollout(arrays=)): dt and the force
+            # parameters from the arrays (behind the barrier), the seeds read in
+            # place of the plan's
+            params = {}
+            bound["arrays"] = {**arrays, "params": opaque(tuple(arrays["params"]))}
+        elif arrays is not None:
             plan, own = self._bind(plan, arrays)
             params = {**params, **own}
         inputs = {
@@ -958,8 +987,14 @@ class FusedSegmentEngine:
                 opaque(theta) if plan.external_fn is not None else None
             ),
         }
+        # the default leaves the argument out (a jaccpot before it)
+        start = {} if self.start_force == "outside" else {"start_force": "adjoint"}
         out = plan.rollout(
-            inputs, checkpoint=self.checkpoint, inner_steps=self.inner_steps
+            inputs,
+            checkpoint=self.checkpoint,
+            inner_steps=self.inner_steps,
+            **start,
+            **bound,
         )
         f_b, bits, needs = out.aux
         aux = jax.lax.stop_gradient(

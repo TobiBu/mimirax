@@ -493,35 +493,57 @@ def figure(record: dict[str, Any]) -> Any:
     ax.set_title("(e) recovery from perturbed starts (successes/starts)", loc="left")
     ax.legend(frameon=False, fontsize=9)
 
-    # (f) cost of a successful fit: passes until theta stayed within tolerance
+    # (f) cost of each successful fit, two readings: passes until theta stayed
+    # within tolerance (from the history: an oracle stop, filled) and passes to
+    # the driver's own stop -- its rule or its full budget (hollow)
     ax = axes[1, 2]
+    offset = {"single": -0.12, "multiple_data": 0.0, "multiple": 0.12}
     for kind, st in METHOD_STYLE.items():
-        xs, ys = [], []
+        xs, ys, xs_stop, ys_stop = [], [], [], []
         for v in configs.values():
             if v["method"] != kind or v["radius"] != 0.1:
                 continue
-            for t in v["passes_to_tolerance_per_start"]:
+            x = v["segments"] * seg_lt + offset[kind]
+            for t, ok, passes, status in zip(
+                v["passes_to_tolerance_per_start"],
+                [e <= SUCCESS_TOL for e in v["error_max_abs_per_start"]],
+                v["segment_passes_per_start"],
+                v["status_per_start"],
+            ):
                 if t is not None:
-                    xs.append(v["segments"] * seg_lt)
+                    xs.append(x)
                     ys.append(t)
-        if not xs:
-            continue
-        ax.scatter(
-            xs,
-            ys,
-            marker=st["marker"],
-            s=36,
-            color=st["colour"],
-            label=st["name"],
-            alpha=0.85,
-            edgecolors="#FFFFFF",
-            linewidths=0.8,
-        )
+                if ok and status in ("converged", "budget"):
+                    xs_stop.append(x)
+                    ys_stop.append(passes)
+        if xs:
+            ax.scatter(
+                xs,
+                ys,
+                marker=st["marker"],
+                s=36,
+                color=st["colour"],
+                label=st["name"] + " (to tolerance)",
+                alpha=0.85,
+                edgecolors="#FFFFFF",
+                linewidths=0.8,
+            )
+        if xs_stop:
+            ax.scatter(
+                xs_stop,
+                ys_stop,
+                marker=st["marker"],
+                s=44,
+                facecolors="none",
+                edgecolors=st["colour"],
+                linewidths=1.2,
+                label="  ... to the driver's stop",
+            )
     ax.set_yscale("log")
     ax.set_xlabel(r"horizon $T$ [Lyapunov times]")
-    ax.set_ylabel("segment passes until within tolerance")
-    ax.set_title("(f) cost of each successful fit", loc="left")
-    ax.legend(frameon=False, fontsize=9)
+    ax.set_ylabel("segment passes per successful fit")
+    ax.set_title("(f) cost: to tolerance (filled), to the driver's stop", loc="left")
+    ax.legend(frameon=False, fontsize=8)
 
     fig.suptitle(
         f"Single vs multiple shooting on a chaotic N = {c.N_STARS} system "

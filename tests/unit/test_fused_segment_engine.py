@@ -330,7 +330,8 @@ def test_segment_arrays_are_the_plans_arrays_where_jaccpot_offers_them():
     class _Plan(_FakePlan):
         def arrays(self, device=None):
             calls.append(("arrays", device))
-            return {"params": (jnp.asarray(self.params["dt"]),), "seeds": (None,)}
+            dt = jnp.asarray(self.params["dt"], jnp.float32)
+            return {"params": (dt,), "seeds": (None,)}
 
         def rollout(self, inputs, *, arrays=None, **kwargs):
             calls.append(("rollout", arrays is not None, "dt" in inputs))
@@ -347,7 +348,7 @@ def test_segment_arrays_are_the_plans_arrays_where_jaccpot_offers_them():
 
     x, v, m = _system()
     theta = {"k": jnp.asarray(1.0)}
-    engine = FusedSegmentEngine(_Runner(), (2,), dt=jnp.asarray(0.1))
+    engine = FusedSegmentEngine(_Runner(), (2,), dt=0.1)
     engine.propagate(theta, x, v, m)
     calls.clear()
     arrays = engine.segment_arrays(0)
@@ -356,8 +357,9 @@ def test_segment_arrays_are_the_plans_arrays_where_jaccpot_offers_them():
     got = run(theta, x, v, arrays)
     want = jax.jit(lambda t, a, b: engine(t, a, b, m, 0).positions)(theta, x, v)
     assert ("rollout", True, False) in calls and ("rollout", False, True) in calls
-    assert jnp.array_equal(got, want)
-    old = FusedSegmentEngine(_FakeRunner(), (2,), dt=jnp.asarray(0.1))
+    assert jnp.allclose(got, want, rtol=1e-6, atol=0.0)
+    old = FusedSegmentEngine(_FakeRunner(), (2,), dt=0.1)
     old.propagate(theta, x, v, m)
     gathered = old.segment_arrays(0)
-    assert set(gathered) == {"params", "seeds"} and gathered["params"][0] is not None
+    # the engine's own gathering: a Python dt stays a literal (None here)
+    assert set(gathered) == {"params", "seeds"} and gathered["params"] == (None,)

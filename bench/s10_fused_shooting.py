@@ -100,9 +100,10 @@ def _args(argv: Optional[list] = None) -> argparse.Namespace:
     )
     ap.add_argument(
         "--cell-min-level",
-        type=int,
+        type=lambda s: s if s == "auto" else int(s),
         default=None,
-        help="override the preset's TreeConfig.cell_min_level (8)",
+        help="override the preset's TreeConfig.cell_min_level (8); 'auto': jaccpot's "
+        "scale-aware pick (S10 follow-ups)",
     )
     ap.add_argument("--seed", type=int, default=3)
     ap.add_argument("--sigma", type=float, default=1e-3, help="observation noise")

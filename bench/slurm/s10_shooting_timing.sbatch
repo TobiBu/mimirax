@@ -22,6 +22,11 @@
 #   al_<N>_one_<opt>            ONE augmented-Lagrangian inner iteration as the driver runs it (prepare, step, check,
 #                               accept) with the whole objective in one program on one card (S = 2 segments in it);
 #                               L-BFGS with optax's zoom line search inside the step.
+#   seg_<N>_adj, al_<N>_c2_adam_adj   the same with each segment's start force inside the rollout's adjoint
+#                               (--start-force adjoint, S10 follow-ups): less device memory; the time it costs or saves.
+#   seg_<N>_auto_adj, pre_<N>_fc1_auto  with the scale-aware level floor (--cell-min-level auto; 1e5 / 1e6 only).
+#   pre_<N>_fc1 with jaccpot >= the S10 follow-ups: the freeze cache also keeps the eager prepare's programs (a warm
+#                               pre-pass compiles nothing).
 #   al_<N>_c<K>_<opt>           the same iteration in mimirax's per-segment mode (track P, AugmentedLagrangian(devices=
 #                               K cards)): one value-and-gradient program per segment, segment k on card k mod K, the
 #                               host sums; S = K (K = 2, 4), and S = 2 on one card (c1). L-BFGS without a line search in
@@ -35,6 +40,9 @@
 # step holds every segment's residuals (W + S L r + ~400 B/p of AL terms): not at 2.5e7. Per segment, card 0 also
 # holds the parameters, multipliers, data and optimizer state (Adam ~200 B/p; L-BFGS +528 B/p): L 20 and Adam only
 # at 2.5e7. Every row runs with the preallocated BFC (BFC below).
+# With --start-force adjoint (jaccpot GradientPlan.rollout(start_force="adjoint"), S10 follow-ups; the *_adj rows) W
+# is 2120 B/p at 1e5, 1070 at 1e6 (cml 8), 424 / 299 at cml 4 / 5 (also --cell-min-level auto's levels there), and a
+# 2.5e7 L 10 segment holds 447 B/p of temporaries (W ~287), peak 633 B/p = 15.8 GB (was 966 B/p = 24.1 GB).
 #
 #SBATCH --job-name=mimirax-s10-shooting-timing
 #SBATCH --partition=accelerated
@@ -83,7 +91,17 @@ for n in 1e5 1e6 2p5e7; do
     "pre_${n}_fc1|1|$base --segments 2 --only prepass"
     "pre_${n}_fc0|1|$base --segments 2 --only prepass --no-freeze-cache"
     "seg_${n}|1|$base --segments 2 --only seggrad"
+    # S10 follow-ups: the start force inside the adjoint (jaccpot GradientPlan.rollout(start_force="adjoint"))
+    "seg_${n}_adj|1|$base --segments 2 --only seggrad --start-force adjoint"
+    "al_${n}_c2_adam_adj|2|$base --segments 2 --devices 2 --only alstep --optimizer adam --start-force adjoint"
   )
+  # ... and the scale-aware level floor (jaccpot cell_min_level="auto"; 8 from ~2.5e7 on this disc)
+  if [ "$n" != 2p5e7 ]; then
+    ROW_LIST+=(
+      "seg_${n}_auto_adj|1|$base --segments 2 --only seggrad --start-force adjoint --cell-min-level auto"
+      "pre_${n}_fc1_auto|1|$base --segments 2 --only prepass --cell-min-level auto"
+    )
+  fi
   for opt in $OPTS; do
     # one program (the S segments sequential, optax's own line search for L-BFGS): not at 2.5e7 (memory)
     if [ "$n" != 2p5e7 ]; then

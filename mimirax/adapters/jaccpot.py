@@ -517,7 +517,10 @@ class FusedSegmentEngine:
         inside its hand-written reverse, for less device memory (W at the S9 2e6
         Plummer calibration 883 -> ~406 B/p), step 0's field then added inside the
         program (an ulp off the runner's eager add for a field of more than one
-        multiply). Needs a jaccpot with the argument.
+        multiply). Needs a jaccpot with the argument. Not the default: under it
+        the segment's forward is the runner's from its node only to round-off (4
+        bytes in ``tests/integration/test_fused_segment_engine.py``'s G1, whose
+        other gates pass, as do the two-card GPU gates; S10 follow-ups).
     keep_forward : bool
         Keep each plan's pre-pass result (its ``forward``: the end state and the
         runner's handle) instead of only the end state (:attr:`ends`). For tests.

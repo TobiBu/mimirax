@@ -28,10 +28,13 @@
 #                               the update, Armijo backtracking on the host (each trial one parallel forward pass; the
 #                               trials per iteration are in the row).
 #
-# MEMORY (40 GB cards): one segment's gradient program is W + L r (W ~ 283 B/p at 2.5e7, r 16 B/p per step, jaccpot
-# production_2026-10.md "S9 (session 2)"); the one-card AL step holds every segment's residuals at once (W + S L r) plus
-# the nodes, multipliers and optimizer state (24 B/p per node array; L-BFGS keeps 2 x 10 of them). Hence L 20 and Adam
-# at 2.5e7 on one card; see the F report for the measured B/p.
+# MEMORY (40 GB cards; measured locally, F report): one segment's gradient program is W + L r with r 16 B/p per step and
+# W (this engine, GradientPlan.rollout: the start force outside the adjoint) 5088 B/p at 1e5, 2382 at 1e6 (cml 8:
+# 1-3 particles per leaf on this disc), ~616 at 2.5e7 (L 10: 776 B/p of temporaries, peak 966 B/p = 22.5 GiB with the
+# preallocated BFC; without preallocation the 18 GiB block did not fit after the pre-pass). The one-card one-program
+# step holds every segment's residuals (W + S L r + ~400 B/p of AL terms): not at 2.5e7. Per segment, card 0 also
+# holds the parameters, multipliers, data and optimizer state (Adam ~200 B/p; L-BFGS +528 B/p): L 20 and Adam only
+# at 2.5e7. Every row runs with the preallocated BFC (BFC below).
 #
 #SBATCH --job-name=mimirax-s10-shooting-timing
 #SBATCH --partition=accelerated

@@ -43,6 +43,39 @@ def test_convergence_from_a_trace() -> None:
     assert not has_converged(trace[:3], rtol=1.0e-6, window=5)
 
 
+def test_a_trace_driven_into_round_off_has_converged() -> None:
+    """A fit that reached the floating-point floor is converged, not unconverged.
+
+    A purely relative criterion says the opposite: down there successive values
+    differ by O(1) relatively however still they are absolutely, so the harder a
+    fit converges the worse its verdict. The tail here is an Adam run on an exact
+    linear-Gaussian problem, which lands at 1e-31 rather than on zero.
+    """
+    trace = jnp.asarray(
+        [1.56e1, 1.37e1, 1.20e1, 1.0e-3, 1.0e-20]
+        + [1.29422492e-31, 1.30963236e-31, 1.35585468e-31] * 4
+    )
+    assert has_converged(trace, rtol=1.0e-8, window=10)
+
+
+def test_a_trace_that_reached_zero_converges_in_either_dtype() -> None:
+    """The division-by-zero guard must not itself underflow to zero.
+
+    ``1e-300`` is exactly zero in float32, so ``0 / (0 + eps)`` is ``nan`` there
+    and ``0`` in float64: the same trace gets opposite verdicts by dtype.
+    """
+    for dtype in (jnp.float32, jnp.float64):
+        trace = jnp.asarray([4.0, 1.0, 0.1] + [0.0] * 7, dtype=dtype)
+        assert not jnp.any(jnp.isnan(relative_change(trace)))
+        assert has_converged(trace, rtol=1.0e-6, window=5)
+
+
+def test_a_trace_still_descending_by_decades_has_not_converged() -> None:
+    """The absolute floor must not call a live descent converged."""
+    trace = jnp.asarray([1.0e2] + [10.0**-k for k in range(1, 12)])
+    assert not has_converged(trace, rtol=1.0e-6, window=5)
+
+
 def test_fisher_information_of_a_quadratic_is_its_hessian() -> None:
     """For 0.5 x^T H x the Fisher matrix is H, in ravel order over a pytree."""
     h = jnp.asarray([[2.0, 0.5, 0.0], [0.5, 1.0, 0.0], [0.0, 0.0, 0.0]])

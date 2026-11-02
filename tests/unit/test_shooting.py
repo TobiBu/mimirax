@@ -13,12 +13,14 @@ from dataclasses import dataclass, field
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 import pytest
 
 from mimirax import (
     AugmentedLagrangian,
     AugmentedLagrangianResult,
+    AugmentedLagrangianState,
     Constraint,
     ForwardModel,
     FunctionConstraint,
@@ -409,6 +411,86 @@ def test_shooting_defects_vanish_under_the_driver(vjp_only: bool) -> None:
     assert float(result.outer_violation[-1]) < 1e-8
     assert abs(float(result.params["theta"]["k"]) - 1.0) < 1e-6
     assert result.num_traces == 1
+
+
+def _shooting_start(model):
+    start = {"k": jnp.asarray(1.25)}
+    nodes = jax.tree_util.tree_map(
+        lambda a: a + 0.01 * jnp.sin(jnp.arange(a.size).reshape(a.shape)),
+        model.init_nodes(start),
+    )
+    return {"theta": start, "nodes": nodes}
+
+
+def _through_numpy(state: AugmentedLagrangianState) -> AugmentedLagrangianState:
+    """What a checkpoint file does to a state: arrays to numpy and back."""
+    arrays = (state.params, state.opt_state, state.multipliers)
+    leaves, treedef = jax.tree_util.tree_flatten(arrays)
+    host = [np.array(leaf) for leaf in leaves]
+    params, opt_state, multipliers = jax.tree_util.tree_unflatten(
+        treedef, [jnp.asarray(h) for h in host]
+    )
+    return state._replace(params=params, opt_state=opt_state, multipliers=multipliers)
+
+
+@pytest.mark.parametrize("which", ["mid_inner", "outer_start"])
+def test_resume_from_a_checkpoint_is_the_uninterrupted_run(which: str) -> None:
+    """A fit resumed from a state its ``checkpoint`` got finishes bitwise as the original."""
+    problem, model, _ = _shooting_problem()
+    driver = AugmentedLagrangian(
+        optimizer=optax.lbfgs(), inner_steps=12, max_outer=6, mu0=10.0, tol=1e-12
+    )
+    states: list[AugmentedLagrangianState] = []
+    full = driver.minimize(problem, _shooting_start(model), checkpoint=states.append)
+    assert len(states) == len(full.objective_trace)
+    assert len(full.outer_steps) >= 3
+    if which == "mid_inner":
+        state = next(s for s in states if s.outer_iteration == 1 and s.inner_step == 5)
+    else:
+        state = next(s for s in states if s.outer_iteration == 2 and s.inner_step == 0)
+    again = driver.minimize(problem, None, resume=_through_numpy(state))
+    for name in (
+        "objective_trace",
+        "violation_trace",
+        "lagrangian_trace",
+        "mu_trace",
+        "outer_objective",
+        "outer_violation",
+        "outer_mu",
+        "outer_steps",
+    ):
+        assert np.array_equal(
+            np.asarray(getattr(full, name)), np.asarray(getattr(again, name))
+        ), name
+    for a, b in zip(
+        jax.tree_util.tree_leaves(full.params), jax.tree_util.tree_leaves(again.params)
+    ):
+        assert np.array_equal(np.asarray(a), np.asarray(b))
+    for a, b in zip(full.multipliers, again.multipliers):
+        assert np.array_equal(np.asarray(a), np.asarray(b))
+    assert full.converged == again.converged
+
+
+def test_a_raising_checkpoint_stops_the_fit_where_it_is() -> None:
+    """The callback may stop a fit (a process's wall-time budget): the state it saw is kept."""
+    problem, model, _ = _shooting_problem()
+    driver = AugmentedLagrangian(optimizer=optax.lbfgs(), inner_steps=5, max_outer=3)
+
+    class Stop(Exception):
+        pass
+
+    seen: list[AugmentedLagrangianState] = []
+
+    def budget(state: AugmentedLagrangianState) -> None:
+        seen.append(state)
+        if len(seen) == 7:
+            raise Stop
+
+    with pytest.raises(Stop):
+        driver.minimize(problem, _shooting_start(model), checkpoint=budget)
+    assert (seen[-1].outer_iteration, seen[-1].inner_step) == (1, 1)
+    assert len(seen[-1].trace["objective"]) == 6
+    assert seen[-1].outer["steps"] == [5]
 
 
 def test_vjp_only_engine_refuses_forward_mode() -> None:

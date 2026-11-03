@@ -8,6 +8,7 @@ from mimirax.testing.doubles import (
     DirectSumGravity,
     LinearForwardModel,
     SoftenedPointMassField,
+    VerletSegmentEngine,
     make_linear_problem,
 )
 
@@ -15,5 +16,6 @@ __all__ = [
     "DirectSumGravity",
     "LinearForwardModel",
     "SoftenedPointMassField",
+    "VerletSegmentEngine",
     "make_linear_problem",
 ]

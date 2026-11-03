@@ -57,6 +57,7 @@ jobs:
           tests/unit/test_testing_doubles.py
           tests/unit/test_observables_m2m.py
           tests/unit/test_m2m.py
+          tests/unit/test_shooting.py
           tests/integration/test_recover_linear_truth.py
 
       - name: Build documentation
@@ -69,3 +70,66 @@ jobs:
         with:
           name: coverage-xml-py${{ matrix.python-version }}
           path: coverage.xml
+
+  # The solver-backed tests (S10, user decision D-4). The job above installs no
+  # solver, so every test that needs jaccpot or nornax is skipped there; this one
+  # installs them from GitHub at PINNED commits and runs the multiple-shooting
+  # tests on jaccpot's direct sum, on CPU, in float64. The fused-lane tests are not
+  # run in CI (they are manual gates on an A100).
+  #
+  # PINS: jaccpot 342d75f9 is branch s9/session2 (PR #491, stacked on #490) and
+  # nornax f67d404 is branch s9/fused-grad-force (nornax PR #22): the S9 heads that
+  # carry `jaccpot.runtime.grad_rollout`. Move both pins to main once jaccpot #490,
+  # #491 and nornax #22 have merged. yggdrax cfc0e73 is its main. Bump the three
+  # together: jaccpot's `yggdrax>=0.0.1` and jax window (>=0.11.2,<0.12) are what
+  # the resolver reconciles here.
+  solver-tests:
+    runs-on: ubuntu-latest
+    env:
+      JAX_ENABLE_X64: "1"
+      JAX_PLATFORMS: cpu
+      YGGDRAX_REF: cfc0e7351e2291099c515ce7f7deb50737faf3c8
+      JACCPOT_REF: 342d75f9287ebfa80846b1d7b6dbb82804adaf2b
+      # nornax s10/shooting-potentials (on top of PR #22): nornax.potentials and
+      # shooting_node on a RebuildingForceModel
+      NORNAX_REF: 48479ae751bcb970de765d2c87eaedb89075185c
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          # jaccpot requires Python >= 3.12.
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install mimirax + the solvers at the pinned commits
+        # One resolver run, so jaccpot's jax window and every package's floor are
+        # reconciled together; yggdrax is named explicitly so jaccpot's
+        # `yggdrax` requirement is met by the pinned commit, not by an index.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]" \
+            "yggdrax @ git+https://github.com/TobiBu/yggdrax.git@${YGGDRAX_REF}" \
+            "jaccpot @ git+https://github.com/TobiBu/jaccpot.git@${JACCPOT_REF}" \
+            "nornax @ git+https://github.com/TobiBu/nornax.git@${NORNAX_REF}"
+          python -c "import jax, jaccpot, nornax, yggdrax; print('jax', jax.__version__)"
+
+      - name: Multiple shooting on the direct sum (CPU)
+        run: >-
+          pytest -o addopts="" --no-header -q
+          tests/unit/test_shooting.py
+          tests/integration/test_multiple_shooting.py
+          tests/integration/test_shooting_galaxy_potentials.py
+
+      - name: The same under runtime type-checking (jaxtyping + beartype)
+        env:
+          MIMIRAX_RUNTIME_TYPECHECK: "1"
+          JACCPOT_RUNTIME_TYPECHECK: "1"
+        run: >-
+          pytest -o addopts="" --no-header -q
+          tests/unit/test_shooting.py
+          tests/integration/test_multiple_shooting.py
+          tests/integration/test_shooting_galaxy_potentials.py

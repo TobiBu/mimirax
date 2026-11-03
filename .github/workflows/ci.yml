@@ -78,22 +78,19 @@ jobs:
   # tests on jaccpot's direct sum, on CPU, in float64. The fused-lane tests are not
   # run in CI (they are manual gates on an A100).
   #
-  # PINS: jaccpot 342d75f9 is branch s9/session2 (PR #491, stacked on #490) and
-  # nornax f67d404 is branch s9/fused-grad-force (nornax PR #22): the S9 heads that
-  # carry `jaccpot.runtime.grad_rollout`. Move both pins to main once jaccpot #490,
-  # #491 and nornax #22 have merged. yggdrax cfc0e73 is its main. Bump the three
-  # together: jaccpot's `yggdrax>=0.0.1` and jax window (>=0.11.2,<0.12) are what
-  # the resolver reconciles here.
+  # PINS: the three mains (2026-11-03), after jaccpot #498 (the S10 follow-ups:
+  # `GradientPlan.rollout(start_force=)`, `GradientPlan.arrays`), nornax #23
+  # (`nornax.potentials`, `shooting_node` on a RebuildingForceModel) and yggdrax
+  # #106. Bump the three together: jaccpot's `yggdrax>=0.0.1` and jax window
+  # (>=0.11.2,<0.12) are what the resolver reconciles here.
   solver-tests:
     runs-on: ubuntu-latest
     env:
       JAX_ENABLE_X64: "1"
       JAX_PLATFORMS: cpu
-      YGGDRAX_REF: cfc0e7351e2291099c515ce7f7deb50737faf3c8
-      JACCPOT_REF: 342d75f9287ebfa80846b1d7b6dbb82804adaf2b
-      # nornax s10/shooting-potentials (on top of PR #22): nornax.potentials and
-      # shooting_node on a RebuildingForceModel
-      NORNAX_REF: 48479ae751bcb970de765d2c87eaedb89075185c
+      YGGDRAX_REF: ac875003282e9e95c4b9e4427c56ae0a2e834181
+      JACCPOT_REF: 96122f6383b3254c350f08d61041143d1344c96a
+      NORNAX_REF: dcf7796df86d28a6c0fb7e0a25e960d96d36bd05
 
     steps:
       - name: Checkout

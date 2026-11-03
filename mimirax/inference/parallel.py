@@ -383,7 +383,9 @@ class ParallelSegmentObjective:
 
         if kind == "value_and_grad":
 
-            def run(theta, start, following, lam, mu, masses, observations, arrays):
+            def value_and_grad_run(
+                theta, start, following, lam, mu, masses, observations, arrays
+            ):
                 self.num_traces += 1  # runs at trace time only
 
                 def of(theta_, start_, following_):
@@ -407,9 +409,13 @@ class ParallelSegmentObjective:
                     aux,
                 )
 
+            program = jax.jit(value_and_grad_run)
+
         else:
 
-            def run(theta, start, following, lam, mu, masses, observations, arrays):
+            def forward_run(
+                theta, start, following, lam, mu, masses, observations, arrays
+            ):
                 self.num_forward_traces += 1  # runs at trace time only
                 _, pieces = value(
                     theta, start, following, lam, mu, masses, observations, arrays
@@ -422,7 +428,8 @@ class ParallelSegmentObjective:
                     aux,
                 )
 
-        program = jax.jit(run)
+            program = jax.jit(forward_run)
+
         self._programs[key] = program
         return program
 

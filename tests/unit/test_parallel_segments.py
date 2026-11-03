@@ -306,10 +306,17 @@ def test_parallel_value_and_gradient_equal_the_one_program(
     assert _max_relative(grads, want_grads) < 1e-13
     reference = problem.evaluate(params)
     assert _max_relative(evaluation.negative_log_posterior, reference[0]) < 1e-14
-    assert _max_relative(evaluation.defects, reference.defects) == 0.0
+    # Round-off, not bitwise. The split re-associates the same sums, and the
+    # ROUND-OFF note in ``mimirax.inference.parallel`` claims bitwise equality
+    # only for two segments and a ``"final"`` output -- never for the
+    # ``"segment_ends"`` shape parametrised above. The exact form held by luck:
+    # CI measures 9.96e-15 here on Python 3.13 and 0.0 on 3.11 and 3.12, with
+    # 3.12 resolving the same jax 0.12.0.1 / numpy 2.5.4 as 3.13. ``1e-14`` is
+    # the tolerance the value and posterior comparisons beside it already use.
+    assert _max_relative(evaluation.defects, reference.defects) < 1e-14
     measured = objective.evaluate(params)
     assert _max_relative(measured.negative_log_posterior, reference[0]) < 1e-14
-    assert _max_relative(measured.defects, reference.defects) == 0.0
+    assert _max_relative(measured.defects, reference.defects) < 1e-14
     assert len(measured.aux) == num_segments
 
 

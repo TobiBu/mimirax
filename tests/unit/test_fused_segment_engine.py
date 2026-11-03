@@ -285,3 +285,81 @@ def test_the_runners_freeze_cache_is_kept_across_pre_passes():
     assert isinstance(runner.caches[0], dict) and runner.caches[0] is runner.caches[1]
     plain = FusedSegmentEngine(_FakeRunner(), (1,), dt=0.1)
     assert plain._plan_options == {}
+
+
+def test_start_force_is_passed_to_the_plans_rollout_only_when_asked():
+    """``start_force="adjoint"`` reaches ``plan.rollout``; the default
+    (``"outside"``) calls it without the argument (a jaccpot before it); an
+    unknown mode is refused."""
+    seen = []
+
+    class _Plan(_FakePlan):
+        def rollout(self, inputs, **kwargs):
+            seen.append(kwargs.get("start_force"))
+            kwargs.pop("start_force", None)
+            return super().rollout(inputs, **kwargs)
+
+    class _Runner(_FakeRunner):
+        def gradient_plan(
+            self, state, masses, *, dt, num_steps, force_params, external_params
+        ):
+            del force_params
+            return _Plan(state, masses, dt, num_steps, external_params, self.slack)
+
+    x, v, m = _system()
+    theta = {"k": jnp.asarray(1.0)}
+    for mode, want in (("outside", None), ("adjoint", "adjoint")):
+        engine = FusedSegmentEngine(_Runner(), (1,), dt=0.1, start_force=mode)
+        engine.propagate(theta, x, v, m)
+        seen.clear()
+        jax.jit(lambda t, a, b: engine(t, a, b, m, 0).positions)(theta, x, v)
+        assert seen == [want]
+    with pytest.raises(ValueError, match="start_force must be"):
+        FusedSegmentEngine(_Runner(), (1,), dt=0.1, start_force="inside")
+
+
+def test_segment_arrays_are_the_plans_arrays_where_jaccpot_offers_them():
+    """A plan with jaccpot's ``GradientPlan.arrays`` / ``rollout(arrays=)``: the
+    engine's ``segment_arrays`` are the plan's own (placed once per plan and
+    device), and a call with them hands them to ``rollout(arrays=)`` -- dt and the
+    force parameters no longer in ``inputs`` -- with the same result as the call
+    without; a plan without the API (an older jaccpot) gets the engine's own
+    gathering, as before."""
+    calls = []
+
+    class _Plan(_FakePlan):
+        def arrays(self, device=None):
+            calls.append(("arrays", device))
+            dt = jnp.asarray(self.params["dt"], jnp.float32)
+            return {"params": (dt,), "seeds": (None,)}
+
+        def rollout(self, inputs, *, arrays=None, **kwargs):
+            calls.append(("rollout", arrays is not None, "dt" in inputs))
+            if arrays is not None:
+                inputs = {**inputs, "dt": arrays["params"][0]}
+            return super().rollout(inputs, **kwargs)
+
+    class _Runner(_FakeRunner):
+        def gradient_plan(
+            self, state, masses, *, dt, num_steps, force_params, external_params
+        ):
+            del force_params
+            return _Plan(state, masses, dt, num_steps, external_params, self.slack)
+
+    x, v, m = _system()
+    theta = {"k": jnp.asarray(1.0)}
+    engine = FusedSegmentEngine(_Runner(), (2,), dt=0.1)
+    engine.propagate(theta, x, v, m)
+    calls.clear()
+    arrays = engine.segment_arrays(0)
+    assert engine.segment_arrays(0) is arrays and calls == [("arrays", None)]
+    run = jax.jit(lambda t, a, b, arr: engine(t, a, b, m, 0, arrays=arr).positions)
+    got = run(theta, x, v, arrays)
+    want = jax.jit(lambda t, a, b: engine(t, a, b, m, 0).positions)(theta, x, v)
+    assert ("rollout", True, False) in calls and ("rollout", False, True) in calls
+    assert jnp.allclose(got, want, rtol=1e-6, atol=0.0)
+    old = FusedSegmentEngine(_FakeRunner(), (2,), dt=0.1)
+    old.propagate(theta, x, v, m)
+    gathered = old.segment_arrays(0)
+    # the engine's own gathering: a Python dt stays a literal (None here)
+    assert set(gathered) == {"params", "seeds"} and gathered["params"] == (None,)

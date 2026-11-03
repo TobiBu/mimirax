@@ -15,7 +15,9 @@ field through the runner's ``external_acceleration_fn`` (mimirax ``rows_field``)
 with ``theta`` its ``external_params``. Softening ``0.015 (N / 1e5)^(-1/3)`` by
 default (about half the mean interparticle spacing in the disc's slab), ``dt``
 0.01 (an orbit at R = 1 is about 9 time units), ``S`` segments of ``L`` steps
-(``FusedSegmentEngine``, one gradient plan per segment, ``checkpoint="step"``).
+(``FusedSegmentEngine``, one gradient plan per segment, ``checkpoint="step"``;
+``--start-force adjoint``: each segment's start force inside the rollout's adjoint,
+jaccpot's ``GradientPlan.rollout(start_force="adjoint")``, S10 follow-ups).
 
 TASKS (one per process; every task writes its JSON record to ``--out``):
 
@@ -98,9 +100,10 @@ def _args(argv: Optional[list] = None) -> argparse.Namespace:
     )
     ap.add_argument(
         "--cell-min-level",
-        type=int,
+        type=lambda s: s if s == "auto" else int(s),
         default=None,
-        help="override the preset's TreeConfig.cell_min_level (8)",
+        help="override the preset's TreeConfig.cell_min_level (8); 'auto': jaccpot's "
+        "scale-aware pick (S10 follow-ups)",
     )
     ap.add_argument("--seed", type=int, default=3)
     ap.add_argument("--sigma", type=float, default=1e-3, help="observation noise")
@@ -129,6 +132,12 @@ def _args(argv: Optional[list] = None) -> argparse.Namespace:
         default="engine",
         choices=("engine", "direct"),
         help="memory: the engine's segment, or one rollout with its start force inside",
+    )
+    ap.add_argument(
+        "--start-force",
+        default="outside",
+        choices=("outside", "adjoint"),
+        help="the engine's start_force: jaccpot GradientPlan.rollout(start_force=)",
     )
     ap.add_argument(
         "--only",
@@ -425,7 +434,8 @@ def make_engine(
         segment=SegmentConfig(steps=length, diagnostics_every=0),
         external_acceleration_fn=rows(),
     )
-    engine = FusedSegmentEngine(runner, (length,) * args.segments, dt=args.dt)
+    start = {} if args.start_force == "outside" else {"start_force": args.start_force}
+    engine = FusedSegmentEngine(runner, (length,) * args.segments, dt=args.dt, **start)
     if not freeze_cache:
         engine._plan_options = {}
     return engine

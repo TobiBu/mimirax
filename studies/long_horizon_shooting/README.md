@@ -7,17 +7,30 @@ shooting is a LONG, CHAOTIC horizon, where the single-shot objective turns rough
 study measures whether and where that cross-over happens, on the direct sum in float64
 (so chaos is not confounded with round-off), N = 1024.
 
+**Rerun, like for like (S10 follow-up, track ST, 2026-11-02/03).** Section 3 was rerun with
+K = 10 starts for every method and horizon, no wall-time cap, every fit to the driver's own
+stopping rule or its full budget. **The qualitative conclusion stands; the price of multiple
+shooting does not.** Measured to the driver's own stop, multiple shooting from data-initialised
+nodes costs its WHOLE budget at every long horizon (43,000-69,000 segment passes; it never meets
+the stopping rule) -- 55x the passes of a single-shooting fit at 9.7 Lyapunov times. Session 2's
+"5,000-13,000 passes" was the oracle reading (passes until theta stayed within tolerance), which
+is reported beside it below. Single shooting at 11.6 Lyapunov times is 1/10, not 3/10.
+
 **Answer in one paragraph.** On this chaotic N = 1024 system (lambda = 0.35 / t_cross, a Lyapunov time
 of 83 steps) single shooting is the right tool up to ~8 Lyapunov times: one smooth basin
-across a 10 % window, 10/10 recoveries in ~450 segment passes, 8-10x cheaper than multiple
-shooting. Between 8 and 10 Lyapunov times its objective turns rough -- the gradient grows
-like `exp(lambda T)`, dozens of spurious minima appear, the true basin shrinks to ~1e-4 --
-and its success falls to 7/10 and 3/10 at 9.7 and 11.6 Lyapunov times and to none of 8
-finished fits at 15.5. There,
-multiple shooting with nodes initialised from the observed states recovers the halo (3/3 at
-each horizon, theta within 4e-4) at 5,000-13,000 passes per fit; with nodes propagated from
-the initial guess it fails like single shooting (0/6). Multiple shooting is worth its cost
-beyond ~10 Lyapunov times, provided its nodes can start near the true trajectory.
+across a 10 % window, 10/10 recoveries in ~450 segment passes. Between 8 and 10 Lyapunov
+times its objective turns rough -- the gradient grows like `exp(lambda T)`, dozens of spurious
+minima appear, the true basin shrinks to ~1e-4 -- and its success falls to 7/10, 1/10 and 0/10
+at 9.7, 11.6 and 15.5 Lyapunov times (K = 10 each, every fit stopped by the driver's rule).
+There, multiple shooting with nodes initialised from the observed states recovers the halo
+10/10 at each horizon (theta within 8e-6 - 4e-4), but at a high price: theta settles within
+1e-3 after a median 6,200-8,300 segment passes (an oracle reading from the progress history),
+and the driver itself never stops before its 20 x 200-step budget (43,000-69,000 passes: the
+defects stall at 7e-5 - 6e-3 with the penalty at its cap). With nodes propagated from the
+initial guess it fails like single shooting (0/10 at 11.6 and 15.5 Lyapunov times).
+Multiple shooting is worth its cost beyond ~10 Lyapunov times, where single shooting fails at
+any price, provided its nodes can start near the true trajectory -- and its driver needs a
+better inner solver before its cost is competitive.
 
 ## The system
 
@@ -147,11 +160,12 @@ minima.
 ## 3. Recovery from perturbed starts
 
 `recovery.py`. Starts `theta_0 = theta* + 0.1 u_k` (`u_k` a random unit vector, seed
-`1000 + k`: 10 % in the halo's mass and scale together), the data of section 2 (the same
-noisy snapshots for every method at a horizon). One driver for every method:
+`1000 + k`, k = 0-9: 10 % in the halo's mass and scale together), the data of section 2 (the
+same noisy snapshots for every method at a horizon). One driver for every method:
 `AugmentedLagrangian(optax.lbfgs(), inner_steps=200, max_outer=20, tol=1e-8,
 mu0=1/sigma^2)` -- session 1's rules otherwise (penalty x10 when the violation does not
-shrink 4x, cap 1e12). Three methods:
+shrink 4x, cap 1e12; stop when the violation is <= 1e-8 AND `f` changed by <= 1e-6 relative
+over an outer iteration). Three methods:
 
 * **single**: `{"theta"}` through `SeriesModel` (one trajectory, all snapshots); no
   defects, so the driver is plain L-BFGS restarted every outer iteration;
@@ -164,60 +178,82 @@ shrink 4x, cap 1e12). Three methods:
 **Success**: `max |theta - theta*| <= 1e-3` at the end (100x closer than the start).
 **Cost**: segment passes (one segment's value and gradient, line-search trial points
 included; counted by a host callback), NOT wall time. A single-shooting evaluation is S
-passes, a multiple-shooting one S passes too.
+passes, a multiple-shooting one S passes too. Two readings of the cost:
 
-**Measurement budget (a deviation, said loudly).** The cards were shared by three tracks
-and a single-card job waited up to 2 h for a slot; multiple-shooting fits are 10-100x
-dearer than single-shooting ones. So: single shooting has K = 10 starts at every horizon;
-multiple shooting has K = 3 (multiple_data at S 5 uses the three starts single shooting
-FAILED on, k = 2, 4, 9; elsewhere k = 0-2), and every multiple-shooting fit was stopped
-by a WALL-TIME CAP (`--cap-min`, status "time cap": 14 min; 40 min for S 8 and S 6
-k = 1; S 6 k = 0 ran 50 min under the batch's process limit, before progress histories
-were recorded) long before
-the driver's own stopping rule (violation <= 1e-8 and a stagnant objective), which no
-multiple-shooting fit reached within the caps. Its "success" is therefore theta at the
-cap, and its cost is the passes after which theta STAYED within the tolerance (from the
-fit's progress history, every 25 inner steps). That reading favours multiple shooting
-(an oracle stop); single shooting's costs are its driver's own full runs.
+* **to the driver's stop** -- the passes of the whole fit, ended by the driver's stopping
+  rule ("converged") or by its full budget of 20 x 200 inner steps ("budget"). No fit was
+  capped or cut: a fit running when its process's GPU claim ended (80 min) saved the
+  driver's whole state (parameters, L-BFGS state, multipliers, penalty, counters) and the
+  next claim resumed it, bitwise as if never stopped (`AugmentedLagrangian.minimize(...,
+  checkpoint=, resume=)`, tested);
+* **to tolerance (ORACLE)** -- the passes after which theta stayed within 1e-3 to the end,
+  read from the fit's progress history (every 25 inner steps). A real fit does not know the
+  truth and cannot stop there; this reading is an optimistic lower bound.
 
-| S | T / t_lambda | single (K = 10): successes, passes per success | multiple_data (K = 3): successes, passes to tolerance | multiple, forward nodes (K = 3) |
-|---|---|---|---|---|
-| 2 | 3.9 | 10/10, 116-126 (all to 3.1e-4, the global minimum) | -- | pilot, 1 start: converged, 7466 passes |
-| 4 | 7.7 | 10/10, 396-480 (2.6e-6) | 2/3 at the 14-min cap, 3792 / 4600 (1.4e-4, 5.5e-4; k1 at 1.4e-3) | -- |
-| 5 | 9.7 | 7/10, 670-1015 (one 11250) | 3/3 on single's 3 FAILED starts, 5020-6880 (2.2e-4-3.5e-4) | -- |
-| 6 | 11.6 | 3/10, 1338 / 4560 / 8550 | 3/3, 6048 / 7992 / (k0 before histories: within 2.1e-4 by 7536) | 0/3, 0.074-0.078 at ~4900 |
-| 8 | 15.5 | 0/8 finished (ends 0.044-0.22); 2 unfinished: k1 at 5.5 after 30400 passes, k9 at 0.044 when cut at 4224 | 3/3 at the 40-min cap, 6640 / 8088 / 13408 (9.2e-5-2.0e-4 at ~31000) | 0/3, 0.095-0.17 at ~4800; pilot 0.046 after the full budget (65328) |
+K = 10 starts in every cell, the same ten starts for every method:
 
-Errors in brackets are `max |theta - theta*|` at the end. "Passes per success" for single
-shooting is its driver's full run. Medians of the inner steps per fit: single 20 / 24 / 34
-/ 41 / 54 at S 2-8; multiple_data 600 / 625 / 2450 / 1825 (the caps, not convergence).
+| S | T / t_lambda | method | successes | driver's stop | passes to the stop, median (range) | passes to tolerance, ORACLE, median (range) | max abs theta error: successes / failures |
+|---|---|---|---|---|---|---|---|
+| 2 | 3.9 | single | 10/10 | 10 converged | 122 (116-126) | 122 (116-126) | 3.1e-4 (the global minimum) / -- |
+| 4 | 7.7 | single | 10/10 | 10 converged | 440 (368-488) | 374 (240-468) | 2.6e-6 / -- |
+| 5 | 9.7 | single | 7/10 | 10 converged | 775 (425-1420) | 585 (405-670) | 3.8e-7 / 0.036-0.090 |
+| 5 | 9.7 | multiple_data | **10/10** | 10 budget | 42,788 (42,605-42,875) | 6,180 (2,915-9,020) | 1.2e-5 - 4.3e-5 / -- |
+| 6 | 11.6 | single | 1/10 | 10 converged | 855 (450-2,778) | 1,014 (one) | 2.5e-8 / 0.022-0.10 |
+| 6 | 11.6 | multiple_data | **10/10** | 10 budget | 51,297 (50,706-51,588) | 6,666 (3,450-10,542) | 1.2e-5 - 2.8e-4 / -- |
+| 6 | 11.6 | multiple | 0/10 | 10 budget | 49,470 (48,858-50,436) | -- | -- / 0.0028-0.090 |
+| 8 | 15.5 | single | 0/10 | 10 converged | 5,328 (664-44,408) | -- | -- / 0.040-0.22 |
+| 8 | 15.5 | multiple_data | **10/10** | 10 budget | 68,404 (67,768-68,768) | 8,288 (4,656-13,848) | 8.4e-6 - 4.1e-4 / -- |
+| 8 | 15.5 | multiple | 0/10 | 10 budget | 65,308 (65,016-65,968) | -- | -- / 0.013-0.23 |
+
+Medians of the inner steps per fit: single 20 / 23 / 34 / 32 / 106 at S 2-8; every
+multiple-shooting fit 4000 (the budget). Not run (time): multiple_data at S 4 and
+multiple at S 4, 5 (section 3's priority 3).[^k3]
 
 * **Single shooting collapses where the landscape does.** 10/10 at 3.9 and 7.7 Lyapunov
-  times, 7/10 at 9.7, 3/10 at 11.6, 0 of 8 finished at 15.5 (two more unfinished, both off
-  the truth when they stopped). Its failures stop in wrong minima
-  0.04-0.1 from the truth (the driver "converges": the objective is stagnant there, 1e8-3e9
-  above its value at the truth); two S 8 starts wandered (log M off by 5.5 at k = 1) while
-  the line search failed step after step. Started AT the truth, S 8 single shooting
-  leaves the basin on its first step and ends at log M = 153 (11624 passes): with a
-  gradient of ~1e12 and a basin ~1e-4 wide, no line search finds a decrease.
-* **Multiple shooting from the data holds there.** 3/3 at 9.7 Lyapunov times on the three starts single
-  shooting failed on, 3/3 at 11.6 and 3/3 at 15.5 (theta within 0.9-2.0e-4 of the truth at
-  the cap), where single shooting has 3/10 and 0 of 8 finished. It needs 5000-13400 passes to settle
-  within 1e-3 -- 5-10x the passes of a successful single-shooting fit at S 5 -- and its
-  defects were still above the 1e-8 tolerance at every cap: the driver had not finished.
-  Its landscape explains why it holds: section 2's slice has one minimum and a basin as
-  wide as the window at every horizon, and each segment's gradient stays ~1e7.
+  times, 7/10 at 9.7, 1/10 at 11.6, 0/10 at 15.5. Every fit, failed or not, stops by the
+  driver's own rule (the objective stagnant): its failures sit in wrong minima 0.02-0.22
+  from the truth, 1e8-3e9 above the objective at the truth. At 15.5 Lyapunov times some
+  starts wander for long (k = 7: 44,408 passes, 411 inner steps, ending 0.22 off) while the
+  line search fails step after step. Started AT the truth (session 2's pilot), S 8 single
+  shooting leaves the basin on its first step: with a gradient of ~1e12 and a basin ~1e-4
+  wide, no line search finds a decrease.
+* **Which start fails is not a property of the start.** At 11.6 Lyapunov times, starts k = 3
+  and 4 succeeded in session 2's runs (8550 and 4560 passes) and fail here (0.022, 0.047)
+  -- the same code path, but a program that differs in the last bits (the GPU evaluation is
+  bitwise reproducible for one compiled program: checked across processes and with XLA's
+  deterministic ops; the difference is in what was compiled). Up to 9.7 Lyapunov times
+  every start's outcome is the same in both runs. On a rough objective the success rate is
+  a statistic over starts AND round-off, and K = 10 is its resolution.
+* **Multiple shooting from the data holds there -- at its whole budget.** 10/10 at 9.7,
+  11.6 and 15.5 Lyapunov times, theta within 8e-6 - 4e-4 of the truth. Theta settles within
+  1e-3 after a median 6,200 / 6,700 / 8,300 passes (oracle), but no fit meets the driver's
+  stopping rule: every one runs its 4000 inner steps (43k / 51k / 68k passes). Why, from the
+  histories: after the first outer iteration the violation is 2e-3 - 5e-2; it never
+  shrinks 4x per outer iteration, so the penalty climbs x10 every time and hits its 1e12
+  cap at outer iteration 7 (one fit: 8), with the violation at 2e-4 - 1e-2; from there 200
+  L-BFGS steps per outer iteration lower it by 0-11 % (geometric mean per outer
+  iteration, 30 fits): it ends at 6.5e-5 - 5.8e-3 (median 1e-4 / 4e-4 / 1.4e-3 at S 5 / 6 /
+  8), and `f` still moves by 0.1-20 % per outer iteration (the rule needs 1e-6). That is a convergence rate of the driver, not a float64 floor (the
+  defects are ten orders above round-off), so the stopping rule was left as it is, for
+  every method alike. Its landscape explains why it holds: section 2's slice has one
+  minimum and a basin as wide as the window at every horizon, and each segment's gradient
+  stays ~1e7.
 * **Multiple shooting from a forward run does not.** Nodes propagated at the start theta
-  are as decorrelated from the data as single shooting's trajectory: 0/3 at S 6 (0.074-0.078
-  after ~4900 passes) and 0/3 at S 8 (0.095-0.17), and the 8-segment pilot (mu0 1e6,
-  the full 20 x 200 budget, 65328 passes, 38 min alone on a card) ended at 0.046 with the
-  defects still at 0.38. On a short horizon it works (pilot, S 2: converged, theta within
-  1e-7 of single shooting's, 7466 passes against single shooting's 126).
-* **The price.** Where both succeed (S 4) single shooting needs 396-480 passes (24 inner
-  steps) and multiple shooting from the data 3800-4600 to stay within 1e-3 -- and its
-  estimate is the cruder one (1.4e-4-5.5e-4 against single shooting's 2.6e-6, the
-  global minimum, at the cap). At S 5-6 multiple shooting from the data needs 5000-7000
-  passes for an answer single shooting reaches in 670-1340 when it reaches it at all.
+  are as decorrelated from the data as single shooting's trajectory: 0/10 at 11.6 Lyapunov
+  times (ends 0.0028-0.090, median 0.024; two came within 1.3e-3 and 8e-4 during the fit
+  and left) and 0/10 at 15.5 (0.013-0.23, median 0.057), defects still at 0.05-0.75 after
+  the full budget. On a short horizon it works (session 2's pilot, S 2: converged, theta
+  within 1e-7 of single shooting's, 7466 passes against single shooting's 126; rerun here
+  for the resume test: converged, 5828 passes).
+* **The price.** At 9.7 Lyapunov times, where both still succeed, single shooting's fits
+  cost a median 775 passes to the driver's stop; multiple shooting from the data costs
+  42,800 -- 55x -- or 6,200 to tolerance by the oracle reading (8x single shooting's 585 to
+  tolerance). Past 11.6 Lyapunov times single shooting does not succeed at any price.
+
+[^k3]: Session 2's first reading (K = 3, every multiple-shooting fit stopped by a wall-time
+cap and scored from its history) had multiple_data 2/3 at S 4 and 3/3 at S 5, 6, 8 at
+5,000-13,400 passes to tolerance, and single shooting 3/10 at S 6; it is superseded by the
+table above.
 
 ## 4. When is multiple shooting worth its cost?
 
@@ -226,58 +262,74 @@ rough, and only if its nodes start near the trajectory.** Measured on this syste
 
 1. **Below ~8 Lyapunov times use single shooting.** Its objective has one minimum in
    `|delta theta| <= 0.1`, 10/10 starts recover the halo to the global minimum (2.6e-6 at
-   7.7 Lyapunov times) in ~450 passes, and multiple shooting costs 8-10x more for a cruder
-   answer (session 1's short-horizon finding, reproduced at N = 1024).
+   7.7 Lyapunov times) in ~450 passes. (Session 1 found multiple shooting 8-10x dearer for
+   the same answer on short horizons; not rerun here at N = 1024.)
 2. **The cross-over is at 8-10 Lyapunov times** (here 650-800 steps; one Lyapunov time is
    83 steps at softening 0.05 a). The single-shot gradient grows as `exp(lambda T)`
    (1.7 e-folds per 1.94-Lyapunov-time segment), spurious minima appear between 7.7 and 9.7
    Lyapunov times (1 -> 6 -> 46 -> 93 at S 4-8), the true basin shrinks from >= 0.1 to
-   2e-3 and then ~1e-4, and single shooting's success falls 10/10 -> 7/10 -> 3/10 -> 0/8 (finished fits).
+   2e-3 and then ~1e-4, and single shooting's success falls 10/10 -> 7/10 -> 1/10 -> 0/10.
    From 16 Lyapunov times even a start AT the truth leaves the basin.
-3. **Beyond it, multiple shooting from data-initialised nodes recovers** (3/3 at 9.7, 11.6
-   and 15.5 Lyapunov times), at 5,000-13,000 segment passes per fit -- far more than a
-   short-horizon single shot, but the long horizon is out of single shooting's reach at
-   any price. The segment length, not the horizon, sets its landscape: keep segments at
-   ~2 Lyapunov times.
+3. **Beyond it, multiple shooting from data-initialised nodes recovers** (10/10 at 9.7,
+   11.6 and 15.5 Lyapunov times). Its answer is in hand after ~6,000-8,000 segment passes,
+   but its driver does not know that: by its own stopping rule it runs to its budget,
+   43,000-69,000 passes -- 55x a single-shooting fit at 9.7 Lyapunov times. The long
+   horizon is out of single shooting's reach at any price, so this is the price of the
+   answer, today. The segment length, not the horizon, sets its landscape: keep segments
+   at ~2 Lyapunov times.
 4. **Multiple shooting with nodes from a forward run at the guess inherits the chaos it is
-   meant to avoid**: the propagated nodes are decorrelated from the data, and 6/6 fits
-   stall 0.07-0.17 from the truth (the full-budget pilot: 0.046). The node initialisation
+   meant to avoid**: the propagated nodes are decorrelated from the data, and 20/20 fits
+   end 0.003-0.23 from the truth with their defects at 0.05-0.75. The node initialisation
    is the method. Here the whole phase-space state is observed, so data-initialised nodes
    are free; with partial observations (projected positions, line-of-sight velocities)
    they need another estimate of the state, and that -- not the segment arithmetic -- is
    the open problem for potential inference on long horizons.
-5. **The price is iterations, not landscape.** The augmented Lagrangian with a VJP-only
+5. **The price is the driver, not the landscape.** The augmented Lagrangian with a VJP-only
    L-BFGS inner loop moves 6N(S-1) node variables (43,008 at S 8) together with two halo
-   parameters; no multiple-shooting fit met the driver's own stopping rule (defects
-   <= 1e-8) inside 40 minutes. A Gauss-Newton / condensing inner solver, the classical
-   companion of multiple shooting, needs forward-mode or per-segment Jacobians that
-   jaccpot's checkpointed `custom_vjp` rollouts do not offer; with them the cost gap
-   should shrink, and track P's parallel segments divide its wall time by the device count.
+   parameters. Its penalty reaches the 1e12 cap after 7 outer iterations, after which the
+   inner L-BFGS barely moves the defects (0-11 % per 200 steps): no multiple-shooting fit
+   met the stopping rule (defects <= 1e-8) within 20 x 200 steps, at any horizon >= 9.7
+   Lyapunov times. A Gauss-Newton / condensing inner solver, the classical companion of
+   multiple shooting, needs forward-mode or per-segment Jacobians that jaccpot's
+   checkpointed `custom_vjp` rollouts do not offer; with them -- or with a gentler penalty
+   schedule -- the cost gap should shrink, and track P's parallel segments divide its wall
+   time by the device count.
 
 **Softening is the dial**: lambda scales as `softening^-1` (and `N^-0.43` at fixed
 softening), so the cross-over horizon in physical time moves with the force resolution --
 a production run at small softening is chaotic sooner, a heavily softened one later.
 
-**Caveats.** One system, one noise realisation, one initial condition; K = 3 for multiple
-shooting (time on the shared cards); multiple-shooting results are at a wall-time cap, its
-"success" and cost read off theta's history, not off a converged driver; the success
-tolerance (1e-3) is far coarser than the long horizons' statistical error (Fisher sigma
-3e-9 at 15.5 Lyapunov times), which neither method reaches.
+**Caveats.** One system, one noise realisation, one initial condition; K = 10 starts per
+cell (a success rate's resolution is 0.1, and on a rough objective which starts succeed
+depends on round-off: two of ten single-shooting outcomes at 11.6 Lyapunov times flipped
+between two compiled programs); one driver configuration (20 x 200 L-BFGS steps, the
+penalty schedule above) for every method -- multiple shooting's cost to its stop is that
+budget, not an intrinsic number; the oracle reading assumes a stop the driver cannot make;
+the success tolerance (1e-3) is far coarser than the long horizons' statistical error
+(Fisher sigma 3e-9 at 15.5 Lyapunov times), which neither method reaches; multiple shooting
+at S 4 and forward-run nodes at S 4, 5 were not rerun.
 
 ## Reproduce
 
 ```bash
-export LONG_HORIZON_RUNS=/export/scratch/tbuck/s9-scratch/s10b/l/runs   # result files
+export LONG_HORIZON_RUNS=/export/scratch/tbuck/s9-scratch/s10c/st/runs   # result files
 JAX_PLATFORMS=cuda,cpu python studies/long_horizon_shooting/lyapunov.py   # ~2 min GPU (CPU: ~1 h)
 JAX_PLATFORMS=cuda,cpu python studies/long_horizon_shooting/roughness.py  # ~15 min GPU
 JAX_PLATFORMS=cuda,cpu python studies/long_horizon_shooting/recovery.py \
-    --method single --segments 2,4,5,6,8 --starts 0-9
+    --method single,multiple_data,multiple --segments 2,4,5,6,8 --starts 0-9
+# or a priority list (lines "method S start"), one fit at a time, in bounded claims:
 JAX_PLATFORMS=cuda,cpu python studies/long_horizon_shooting/recovery.py \
-    --method multiple_data --segments 6,8 --starts 0-2 --cap-min 40   # etc.: see section 3
+    --queue queue.txt --deadline-min 80      # rerun until --peek reports "done"
 python studies/long_horizon_shooting/summary.py   # JSON + figure, CPU, seconds
 ```
 
 Every script skips configurations whose result file exists, so any of them can be
-stopped and rerun. `cpu` must be in `JAX_PLATFORMS` for `recovery.py` (its pass
-counter is a host callback). The test that pins the qualitative claim cheaply is
+stopped and rerun; `recovery.py` also resumes a stopped FIT from its saved driver state
+(`partial/<name>.state.{npz,json}`, every 5 min and at `--deadline-min`). `cpu` must be in
+`JAX_PLATFORMS` for `recovery.py` (its pass counter is a host callback). One fit per card:
+at N = 1024 one process saturates an A100 (two or more sharing a card gave fewer passes per
+second in total). Section 3's runs: mimirax 44daca0-ee633d2 (identical fitting code),
+jaccpot 5385b164, nornax 48479ae7, jax 0.11.2, cards 6/7 (A100 40 GB), 2026-11-02/03;
+sections 1-2 are session 2's (`/export/scratch/tbuck/s9-scratch/s10b/l/runs`, copied). The
+test that pins the qualitative claim cheaply is
 `tests/integration/test_long_horizon_shooting.py` (CPU, 19 s).

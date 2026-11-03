@@ -15,6 +15,7 @@ from mimirax._registry import Registry
 from mimirax.inference.augmented_lagrangian import (
     AugmentedLagrangian,
     AugmentedLagrangianResult,
+    AugmentedLagrangianState,
     augmented_lagrangian_value,
     defect_violation,
 )
@@ -30,6 +31,7 @@ from mimirax.inference.vi import MeanFieldVI
 __all__ = [
     "AugmentedLagrangian",
     "AugmentedLagrangianResult",
+    "AugmentedLagrangianState",
     "HMC",
     "METHODS",
     "NUTS",

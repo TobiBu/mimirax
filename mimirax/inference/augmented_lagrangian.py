@@ -77,6 +77,7 @@ from mimirax.parameters import FunctionConstraint, constraint_violation
 __all__ = [
     "AugmentedLagrangian",
     "AugmentedLagrangianResult",
+    "AugmentedLagrangianState",
     "augmented_lagrangian_value",
     "defect_violation",
 ]
@@ -133,6 +134,60 @@ class AugmentedLagrangianResult(NamedTuple):
     converged: bool
     num_traces: int
     num_redos: int
+
+
+class AugmentedLagrangianState(NamedTuple):
+    """The driver's whole state at the top of an inner step.
+
+    :meth:`AugmentedLagrangian.minimize` hands one to its ``checkpoint``
+    callback before every inner step and takes one as ``resume``: a run resumed
+    from a state continues exactly as the run that produced it would have (the
+    same steps, bitwise, on the same device and programs). For long fits that
+    must outlive a process (a bounded GPU claim, a disconnect).
+
+    Attributes
+    ----------
+    params : PyTree
+        The parameters the next step starts from.
+    opt_state : Any
+        The inner optimizer's state (re-initialised at every outer iteration).
+    multipliers : tuple[Array, ...]
+        The multipliers of the running outer iteration.
+    mu : float
+        Its penalty.
+    outer_iteration : int
+        Index of the running outer iteration (0-based).
+    inner_step : int
+        Inner steps already taken in it.
+    previous_value : Optional[float]
+        ``L`` of its previous inner step (the inner early stop), ``None`` before
+        its first.
+    previous_violation : float
+        The previous outer iteration's violation (``inf`` in the first).
+    previous_objective : Optional[float]
+        The previous outer iteration's ``f`` (``None`` in the first).
+    redos : int
+        Steps redone after a failed check so far.
+    trace : dict[str, list[float]]
+        The inner histories so far (``objective``, ``violation``,
+        ``lagrangian``, ``mu``): copies.
+    outer : dict[str, list[float]]
+        The outer histories so far (``objective``, ``violation``, ``mu``,
+        ``steps``): copies.
+    """
+
+    params: PyTree
+    opt_state: Any
+    multipliers: tuple[Array, ...]
+    mu: float
+    outer_iteration: int
+    inner_step: int
+    previous_value: Optional[float]
+    previous_violation: float
+    previous_objective: Optional[float]
+    redos: int
+    trace: dict[str, list[float]]
+    outer: dict[str, list[float]]
 
 
 def defect_violation(defects: tuple[Array, ...]) -> Scalar:
@@ -457,7 +512,12 @@ class AugmentedLagrangian:
         return _PerSegment(self, problem, self.devices)
 
     def minimize(
-        self, problem: InferenceProblem, params: PyTree
+        self,
+        problem: InferenceProblem,
+        params: PyTree,
+        *,
+        checkpoint: Optional[Callable[[AugmentedLagrangianState], None]] = None,
+        resume: Optional[AugmentedLagrangianState] = None,
     ) -> AugmentedLagrangianResult:
         """Minimize ``problem``'s objective subject to its defects vanishing.
 
@@ -468,7 +528,15 @@ class AugmentedLagrangian:
             that has :attr:`~InferenceProblem.constraints`; without either the
             driver is a plain optax loop.
         params : PyTree
-            The starting point.
+            The starting point (ignored when ``resume`` is given).
+        checkpoint : Optional[Callable[[AugmentedLagrangianState], None]]
+            Called on the host before every inner step with the driver's whole
+            state (opt-in; ``None``: nothing is called). It may save the state,
+            or raise to stop the fit there.
+        resume : Optional[AugmentedLagrangianState]
+            Continue from a state a ``checkpoint`` call received (its arrays may
+            have been round-tripped through numpy) instead of starting at
+            ``params``.
 
         Returns
         -------
@@ -484,35 +552,69 @@ class AugmentedLagrangian:
         """
         forward = problem.forward
         evaluator = self._evaluator(problem)
-        multipliers = tuple(
-            jnp.zeros(s.shape, s.dtype) for s in evaluator.defect_shapes(params)
-        )
-        params = evaluator.place(_strong(params))
-        multipliers = evaluator.place(multipliers)
-        mu = float(self.mu0)
-        redos = 0
-        trace: dict[str, list[float]] = {
-            "objective": [],
-            "violation": [],
-            "lagrangian": [],
-            "mu": [],
-        }
-        outer: dict[str, list[float]] = {
-            "objective": [],
-            "violation": [],
-            "mu": [],
-            "steps": [],
-        }
-        previous_violation = math.inf
-        previous_objective: float | None = None
+        if resume is None:
+            multipliers = tuple(
+                jnp.zeros(s.shape, s.dtype) for s in evaluator.defect_shapes(params)
+            )
+            params = evaluator.place(_strong(params))
+            multipliers = evaluator.place(multipliers)
+            mu = float(self.mu0)
+            redos = 0
+            trace: dict[str, list[float]] = {
+                "objective": [],
+                "violation": [],
+                "lagrangian": [],
+                "mu": [],
+            }
+            outer: dict[str, list[float]] = {
+                "objective": [],
+                "violation": [],
+                "mu": [],
+                "steps": [],
+            }
+            previous_violation = math.inf
+            previous_objective: float | None = None
+            first_outer = 0
+        else:
+            params = evaluator.place(_strong(resume.params))
+            multipliers = evaluator.place(_strong(tuple(resume.multipliers)))
+            mu = float(resume.mu)
+            redos = int(resume.redos)
+            trace = {k: list(v) for k, v in resume.trace.items()}
+            outer = {k: list(v) for k, v in resume.outer.items()}
+            previous_violation = float(resume.previous_violation)
+            previous_objective = resume.previous_objective
+            first_outer = int(resume.outer_iteration)
         converged = False
 
-        for _ in range(self.max_outer):
-            opt_state = _strong(self.optimizer.init(params))
+        for outer_iteration in range(first_outer, self.max_outer):
+            if resume is not None and outer_iteration == first_outer:
+                opt_state = evaluator.place(_strong(resume.opt_state))
+                previous_value: float | None = resume.previous_value
+                taken = int(resume.inner_step)
+            else:
+                opt_state = _strong(self.optimizer.init(params))
+                previous_value = None
+                taken = 0
             mu_array = jnp.asarray(mu, dtype=jnp.result_type(float))
-            previous_value: float | None = None
-            taken = 0
-            for _ in range(self.inner_steps):
+            while taken < self.inner_steps:
+                if checkpoint is not None:
+                    checkpoint(
+                        AugmentedLagrangianState(
+                            params=params,
+                            opt_state=opt_state,
+                            multipliers=multipliers,
+                            mu=mu,
+                            outer_iteration=outer_iteration,
+                            inner_step=taken,
+                            previous_value=previous_value,
+                            previous_violation=previous_violation,
+                            previous_objective=previous_objective,
+                            redos=redos,
+                            trace={k: list(v) for k, v in trace.items()},
+                            outer={k: list(v) for k, v in outer.items()},
+                        )
+                    )
                 _host_prepare(forward, params)
                 out = evaluator.step(params, opt_state, multipliers, mu_array)
                 attempts = 0

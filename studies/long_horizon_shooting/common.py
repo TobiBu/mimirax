@@ -448,6 +448,23 @@ class ProgressLog:
         #: ``[inner steps, segment passes, max |theta - theta*|]`` at every write
         self.history: list[list[float]] = []
 
+    def restore(self, steps: int, history: list[list[float]], elapsed: float) -> None:
+        """Continue a resumed fit's log: its step count, history and wall time so far.
+
+        Parameters
+        ----------
+        steps : int
+            Inner steps the fit had taken.
+        history : list[list[float]]
+            Its :attr:`history` so far.
+        elapsed : float
+            Wall seconds it had run (information only).
+        """
+        import time
+
+        self.steps, self.history = int(steps), [list(h) for h in history]
+        self.start = time.time() - float(elapsed)
+
     def reset(self, path: Path | None, **meta: Any) -> None:
         """Start (or, with ``path=None``, stop) logging a fit.
 
@@ -765,6 +782,40 @@ def read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text())
 
 
+def code_versions() -> dict[str, str]:
+    """The git commit of every package the fits run (``+dirty`` with local changes).
+
+    Returns
+    -------
+    dict[str, str]
+        ``{"mimirax": ..., "jaccpot": ..., "nornax": ...}``; ``"unknown"`` when a
+        package is not in a git checkout.
+    """
+    import importlib
+    import subprocess
+
+    out = {}
+    for name in ("mimirax", "jaccpot", "nornax"):
+        try:
+            folder = Path(importlib.import_module(name).__file__ or "").parent
+            head = subprocess.run(
+                ["git", "-C", str(folder), "rev-parse", "HEAD"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+            dirty = subprocess.run(
+                ["git", "-C", str(folder), "status", "--porcelain", "-uno"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+            out[name] = head + ("+dirty" if dirty else "")
+        except (OSError, subprocess.CalledProcessError, ImportError):
+            out[name] = "unknown"
+    return out
+
+
 def provenance() -> dict[str, Any]:
     """The configuration every result file records.
 
@@ -776,6 +827,7 @@ def provenance() -> dict[str, Any]:
     import platform
 
     return {
+        "code": code_versions(),
         "jax": jax.__version__,
         "device": str(jax.devices()[0]),
         "x64": bool(jax.config.read("jax_enable_x64")),

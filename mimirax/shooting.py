@@ -33,6 +33,36 @@ every engine without them):
   auxes in segment order. ``False`` means the evaluation ran on a truncated force
   (a capacity verdict failed): the caller re-prepares and redoes the step.
 
+Two more, for the programs that run the segments (session S10/2):
+
+* ``segment_key(segment) -> Hashable`` -- HOST. Segments with equal keys compute
+  the same function of their inputs, so one traced program serves them all (the
+  direct sum: the segment's length; the fused lane: the segment and its plan, so
+  a re-plan changes the key and only that segment's program is traced again).
+  Without it every segment is its own program.
+* ``segment_arrays(segment, device=None) -> PyTree`` -- HOST. The arrays a
+  segment's program reads that are neither the state nor ``theta`` (the fused
+  lane: its plan's traced parameters and f_b seeds), placed on ``device``; the
+  engine is then called with ``arrays=`` and reads them as ARGUMENTS of the
+  program rather than as constants folded into it. Without it the engine is
+  called as before.
+
+DATA ARE ARGUMENTS. The masses, the initial condition and (in
+:class:`~mimirax.inference.InferenceProblem`) the observations are what an
+objective reads but never differentiates. Closed over, they are constants
+embedded in the compiled program -- harmless at ``N = 64``, prohibitive at
+``1e5-1e6``. :meth:`MultipleShootingForwardModel.data_arrays` collects them and
+:meth:`MultipleShootingForwardModel.with_data_arrays` rebuilds the model around
+(traced) replacements, which is how the drivers pass them as arguments.
+
+SEGMENTS IN PARALLEL. With the data out of the closure, the objective of a
+multiple-shooting problem is a sum of per-segment terms (its multiplier and
+penalty terms in ``c_k = node_{k+1} - end_k``, and the likelihood of the
+segments that are observed) plus terms of the parameters alone (the priors).
+:meth:`MultipleShootingForwardModel.split_objective` says how a problem's
+likelihood splits (:class:`SegmentSplit`); :mod:`mimirax.inference.parallel`
+runs one program per segment, one device each.
+
 :class:`MultipleShootingForwardModel` puts the segments together. It is a
 :class:`~mimirax.protocols.ForwardModel` (``model(params)`` is the prediction),
 a :class:`~mimirax.protocols.Constraint` (``model.defect(params)`` the stacked
@@ -44,21 +74,26 @@ defects), and it offers both from ONE pass of the segments
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import dataclasses
+from collections.abc import Callable, Hashable, Sequence
 from dataclasses import dataclass
 from typing import Any, NamedTuple, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
 
 from mimirax._typing import PerParticle, PyTree, Vec3
 
 __all__ = [
+    "BoundSegmentEngine",
     "MultipleShootingForwardModel",
     "SegmentEngine",
     "SegmentResult",
+    "SegmentSplit",
     "ShootingEvaluation",
+    "segment_key",
 ]
 
 #: what :attr:`MultipleShootingForwardModel.output` accepts
@@ -147,6 +182,147 @@ class ShootingEvaluation(NamedTuple):
     prediction: PyTree
     defects: Array
     auxes: tuple
+
+
+def segment_key(engine: Any, segment: int) -> Hashable:
+    """Return the key under which ``engine`` 's segment ``segment`` is one program.
+
+    Parameters
+    ----------
+    engine : Any
+        A :class:`SegmentEngine`.
+    segment : int
+        The segment.
+
+    Returns
+    -------
+    Hashable
+        ``engine.segment_key(segment)`` when the engine has the capability (module
+        docstring), else ``("segment", segment)``: every segment its own program.
+    """
+    key = getattr(engine, "segment_key", None)
+    return ("segment", int(segment)) if key is None else key(int(segment))
+
+
+@dataclass(frozen=True)
+class BoundSegmentEngine:
+    """An engine called with its per-segment ``arrays`` (module docstring).
+
+    What :meth:`MultipleShootingForwardModel.with_data_arrays` puts in the model
+    so that a traced evaluation hands each segment its (traced) arrays. Only the
+    traced call is forwarded: ``prepare`` / ``check`` stay on the original engine,
+    which the drivers call on the host.
+
+    Attributes
+    ----------
+    engine : Any
+        An engine with ``segment_arrays``.
+    arrays : tuple
+        One entry per segment, as ``engine.segment_arrays(k)`` returned it (or
+        tracers of it).
+    """
+
+    engine: Any
+    arrays: tuple
+
+    def __call__(
+        self,
+        theta: PyTree,
+        positions: Array,
+        velocities: Array,
+        masses: Array,
+        segment: int,
+    ) -> SegmentResult:
+        """Run segment ``segment`` with its arrays.
+
+        Parameters
+        ----------
+        theta : PyTree
+            The field's parameters.
+        positions : Array
+            ``[N, 3]`` start positions.
+        velocities : Array
+            ``[N, 3]`` start velocities.
+        masses : Array
+            ``[N]`` masses.
+        segment : int
+            Which segment. Static.
+
+        Returns
+        -------
+        SegmentResult
+            The engine's result.
+        """
+        return self.engine(
+            theta, positions, velocities, masses, segment, arrays=self.arrays[segment]
+        )
+
+
+class SegmentSplit(NamedTuple):
+    """How a problem's log-likelihood splits over the segments.
+
+    ``log_likelihood = sum_k term(end_k, observations[k])`` over the segments ``k``
+    in :attr:`observed_segments`, ``end_k = {"positions": [N, 3], "velocities":
+    [N, 3]}`` the end of segment ``k``. With the priors (functions of the
+    parameters alone) and the per-segment multiplier and penalty terms, that is the
+    whole augmented Lagrangian (:mod:`mimirax.inference.parallel`).
+
+    Attributes
+    ----------
+    model : Any
+        The :class:`MultipleShootingForwardModel` the split is of.
+    observed_segments : tuple[int, ...]
+        The segments that carry a likelihood term.
+    observations : tuple
+        One entry per segment: ``{"observed": ..., "likelihood": ...}`` (the
+        segment's data and the likelihood's own arrays, e.g. a per-point
+        ``sigma``, or ``None``), or ``None`` for a segment without data. Arrays: a
+        program takes them as arguments.
+    term : Callable[[dict, Any], Array]
+        ``term(end, observations[k]) -> scalar`` log-likelihood of one segment.
+        The same function for every segment (one traced program serves equal
+        segments).
+    """
+
+    model: Any
+    observed_segments: tuple[int, ...]
+    observations: tuple
+    term: Callable[[dict, Any], Array]
+
+
+def _likelihood_arrays(likelihood: Any) -> Any:
+    """Return ``likelihood.data_arrays()`` when it has the capability, else ``None``.
+
+    Parameters
+    ----------
+    likelihood : Any
+        A :class:`~mimirax.protocols.Likelihood`.
+
+    Returns
+    -------
+    Any
+        Its arrays, or ``None``.
+    """
+    arrays = getattr(likelihood, "data_arrays", None)
+    return None if arrays is None else arrays()
+
+
+def _bind_likelihood(likelihood: Any, arrays: Any) -> Any:
+    """Return ``likelihood`` with its arrays replaced (``None``: unchanged).
+
+    Parameters
+    ----------
+    likelihood : Any
+        A :class:`~mimirax.protocols.Likelihood`.
+    arrays : Any
+        What its ``data_arrays`` returned, or tracers of it.
+
+    Returns
+    -------
+    Any
+        The likelihood to evaluate.
+    """
+    return likelihood if arrays is None else likelihood.with_data_arrays(arrays)
 
 
 @dataclass(frozen=True)
@@ -454,6 +630,175 @@ class MultipleShootingForwardModel:
         if check is None:
             return True
         return bool(check(tuple(auxes)))
+
+    # ------------------------------------------------------------------
+    # Data as arguments; the split over segments (module docstring).
+    # ------------------------------------------------------------------
+
+    def data_arrays(self) -> dict:
+        """Return the arrays the model reads but does not differentiate. Host.
+
+        Returns
+        -------
+        dict
+            ``masses``, ``initial_positions``, ``initial_velocities`` (``None``
+            with :attr:`free_initial`), and ``engine``: every segment's
+            ``engine.segment_arrays(k)`` when the engine has the capability, else
+            ``None``.
+        """
+        arrays = getattr(self.engine, "segment_arrays", None)
+        return {
+            "masses": jnp.asarray(self.masses),
+            "initial_positions": (
+                None
+                if self.initial_positions is None
+                else jnp.asarray(self.initial_positions)
+            ),
+            "initial_velocities": (
+                None
+                if self.initial_velocities is None
+                else jnp.asarray(self.initial_velocities)
+            ),
+            "engine": (
+                None
+                if arrays is None
+                else tuple(arrays(k) for k in range(self.num_segments))
+            ),
+        }
+
+    def with_data_arrays(self, data: dict) -> MultipleShootingForwardModel:
+        """Return the model with its data replaced (e.g. by a program's arguments).
+
+        Parameters
+        ----------
+        data : dict
+            As :meth:`data_arrays` returned it, or tracers of it.
+
+        Returns
+        -------
+        MultipleShootingForwardModel
+            The same model reading ``data``; the engine is wrapped in a
+            :class:`BoundSegmentEngine` when ``data["engine"]`` is not ``None``.
+        """
+        engine = self.engine
+        if data.get("engine") is not None:
+            engine = BoundSegmentEngine(self.engine, tuple(data["engine"]))
+        return dataclasses.replace(
+            self,
+            engine=engine,
+            masses=data["masses"],
+            initial_positions=data["initial_positions"],
+            initial_velocities=data["initial_velocities"],
+        )
+
+    def split_objective(
+        self, observable: Callable[[Any], Any], likelihood: Any, observed: Any
+    ) -> SegmentSplit:
+        """Split ``likelihood.log_prob(observable(prediction), observed)`` over segments.
+
+        * :attr:`output` ``"final"``: the prediction is the last segment's end, so
+          the last segment carries the whole likelihood, whatever the observable
+          and the likelihood are.
+        * ``"segment_ends"``: separable when the likelihood is i.i.d. Gaussian
+          (:class:`~mimirax.GaussianLikelihood`) and the observable maps the
+          stacked ends SEGMENT-WISE: its output's leading axis is the segment (on
+          ``[S, N, 3]`` ends it returns ``[S, ...]``, on one segment's ``[1, N,
+          3]`` ``[1, ...]``), and ``observed`` is ``[S, ...]``. Segment ``k`` then
+          carries ``log_prob(observable(end_k[None]), observed[k:k+1])`` (with
+          ``sigma[k:k+1]`` when ``sigma`` has the segment axis). The shapes are
+          checked (``jax.eval_shape``); that row ``k`` of the observable depends
+          on segment ``k`` alone is the observable's contract (a normalisation
+          across segments would break it).
+
+        Parameters
+        ----------
+        observable : Callable[[Any], Any]
+            The problem's observable.
+        likelihood : Any
+            The problem's likelihood.
+        observed : Any
+            The problem's data.
+
+        Returns
+        -------
+        SegmentSplit
+            The split.
+
+        Raises
+        ------
+        ValueError
+            If the likelihood does not split (``"segment_ends"`` with a
+            non-Gaussian likelihood or an observable / data that are not
+            segment-wise).
+        """
+        count = self.num_segments
+        arrays = _likelihood_arrays(likelihood)
+        if self.output == "final":
+
+            def final_term(end: dict, data: Any) -> Array:
+                bound = _bind_likelihood(likelihood, data["likelihood"])
+                return bound.log_prob(observable(end), data["observed"])
+
+            observations = (None,) * (count - 1) + (
+                {"observed": observed, "likelihood": arrays},
+            )
+            return SegmentSplit(self, (count - 1,), observations, final_term)
+
+        from mimirax.likelihoods import GaussianLikelihood
+
+        if not isinstance(likelihood, GaussianLikelihood):
+            raise ValueError(
+                "output='segment_ends' splits over segments only for an i.i.d. "
+                f"GaussianLikelihood, got {type(likelihood).__name__}"
+            )
+        n = int(np.shape(self.masses)[0])
+        dtype = jnp.result_type(float)
+
+        def ends(count_: int) -> dict:
+            shape = jax.ShapeDtypeStruct((count_, n, 3), dtype)
+            return {"positions": shape, "velocities": shape}
+
+        full = jax.eval_shape(observable, ends(count))
+        one = jax.eval_shape(observable, ends(1))
+        shape = tuple(np.shape(observed))
+        if (
+            tuple(full.shape) != shape
+            or not shape
+            or shape[0] != count
+            or tuple(one.shape) != (1,) + shape[1:]
+        ):
+            raise ValueError(
+                "output='segment_ends' splits over segments only for a segment-wise "
+                f"observable: on [{count}, N, 3] ends it gives {tuple(full.shape)}, "
+                f"on [1, N, 3] {tuple(one.shape)}, the data are {shape} (need "
+                f"[{count}, ...], [1, ...] and [{count}, ...])"
+            )
+        sigma = None if arrays is None else arrays.get("sigma")
+        per_segment = (
+            sigma is not None
+            and np.ndim(sigma) == len(shape)
+            and np.shape(sigma)[0] == count
+            and count > 1
+        )
+
+        def likelihood_arrays(k: int) -> Any:
+            if not per_segment or arrays is None or sigma is None:
+                return arrays
+            return {**arrays, "sigma": sigma[k : k + 1]}
+
+        def segment_term(end: dict, data: Any) -> Array:
+            bound = _bind_likelihood(likelihood, data["likelihood"])
+            stacked = {name: value[None] for name, value in end.items()}
+            return bound.log_prob(observable(stacked), data["observed"])
+
+        observations = tuple(
+            {
+                "observed": observed[k : k + 1],
+                "likelihood": likelihood_arrays(k),
+            }
+            for k in range(count)
+        )
+        return SegmentSplit(self, tuple(range(count)), observations, segment_term)
 
 
 def stop_aux(aux: Any) -> Any:

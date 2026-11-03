@@ -332,6 +332,21 @@ class VerletSegmentEngine:
     gravitational_constant: float = 1.0
     vjp_only: bool = False
 
+    def segment_key(self, segment: int) -> tuple:
+        """Return the key of segment ``segment`` 's program: its length.
+
+        Parameters
+        ----------
+        segment : int
+            The segment.
+
+        Returns
+        -------
+        tuple
+            ``("verlet", segment_steps[segment])``: equal lengths, one program.
+        """
+        return ("verlet", int(self.segment_steps[segment]))
+
     def _acceleration(self, theta: PyTree, positions: Array, masses: Array) -> Array:
         """Return the self-gravity plus the field at ``positions``.
 

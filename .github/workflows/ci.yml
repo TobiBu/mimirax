@@ -58,6 +58,7 @@ jobs:
           tests/unit/test_observables_m2m.py
           tests/unit/test_m2m.py
           tests/unit/test_shooting.py
+          tests/unit/test_parallel_segments.py
           tests/integration/test_recover_linear_truth.py
 
       - name: Build documentation
@@ -121,8 +122,11 @@ jobs:
         run: >-
           pytest -o addopts="" --no-header -q
           tests/unit/test_shooting.py
+          tests/unit/test_parallel_segments.py
           tests/integration/test_multiple_shooting.py
+          tests/integration/test_parallel_segments.py
           tests/integration/test_shooting_galaxy_potentials.py
+          tests/integration/test_long_horizon_shooting.py
 
       - name: The same under runtime type-checking (jaxtyping + beartype)
         env:
@@ -131,5 +135,8 @@ jobs:
         run: >-
           pytest -o addopts="" --no-header -q
           tests/unit/test_shooting.py
+          tests/unit/test_parallel_segments.py
           tests/integration/test_multiple_shooting.py
+          tests/integration/test_parallel_segments.py
           tests/integration/test_shooting_galaxy_potentials.py
+          tests/integration/test_long_horizon_shooting.py

@@ -10,9 +10,13 @@ supported way to say what each observable's uncertainty actually is.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
+from typing import Any
 
+import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
 
 from mimirax._typing import Scalar, SigmaLike
@@ -88,3 +92,37 @@ class GaussianLikelihood:
             ``-0.5 * chi_squared(predicted, observed, sigma)``.
         """
         return -0.5 * chi_squared(predicted, observed, self.sigma)
+
+    def data_arrays(self) -> dict | None:
+        """Return the arrays of the likelihood, for a program to take as arguments.
+
+        A per-point :attr:`sigma` is as large as the data; closed over, it would be
+        a constant of the compiled program (``mimirax.shooting``, "data are
+        arguments"). A Python-number ``sigma`` stays a literal.
+
+        Returns
+        -------
+        dict | None
+            ``{"sigma": sigma}`` when :attr:`sigma` is an array, else ``None``.
+        """
+        if isinstance(self.sigma, (jax.Array, np.ndarray)):
+            return {"sigma": self.sigma}
+        return None
+
+    def with_data_arrays(self, arrays: Any) -> GaussianLikelihood:
+        """Return the likelihood with :attr:`sigma` replaced.
+
+        Parameters
+        ----------
+        arrays : Any
+            ``{"sigma": ...}`` as :meth:`data_arrays` returned it (or tracers of
+            it), or ``None`` for no change.
+
+        Returns
+        -------
+        GaussianLikelihood
+            The likelihood reading ``arrays``.
+        """
+        if arrays is None:
+            return self
+        return dataclasses.replace(self, sigma=arrays["sigma"])

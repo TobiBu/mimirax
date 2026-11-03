@@ -66,6 +66,15 @@ from jax import Array
 from mimirax._typing import PerParticle, PyTree, Vec3
 from mimirax.shooting import SegmentResult
 
+# ``isinstance(x, Tracer)`` is how the runtime asks "am I inside a trace?", and
+# there is no public spelling of it: ``jax.core`` is absent from ``jax.__all__``
+# and resolves to ``jax._src.core``, while ``jax.extend.core.Tracer`` does not
+# exist on the supported jax range (checked against 0.10.2). ``import jax``
+# binds the submodule, so the name resolves at import; the suppression is for
+# the missing public re-export, not for a missing attribute. jaccpot holds the
+# same dependency in its ``_jax_compat`` module; this is the one site here.
+Tracer = jax.core.Tracer  # pyright: ignore[reportAttributeAccessIssue]
+
 __all__ = [
     "DirectSumSegmentEngine",
     "FusedSegmentEngine",
@@ -735,7 +744,7 @@ class FusedSegmentEngine:
         plan = self.plans[segment]
         if plan is None:
             leaves = jax.tree_util.tree_leaves((theta, positions, velocities, masses))
-            if any(isinstance(leaf, jax.core.Tracer) for leaf in leaves):
+            if any(isinstance(leaf, Tracer) for leaf in leaves):
                 raise RuntimeError(
                     f"segment {segment} has no plan: call prepare(theta, nodes, "
                     "masses) or propagate(...) before tracing the objective"

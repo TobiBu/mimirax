@@ -12,8 +12,12 @@ reaches ``c = 0`` at a finite ``mu``: an outer loop updates the multipliers
 ``lambda <- lambda + mu c`` and grows ``mu`` only when the violation stalls;
 an inner loop minimizes ``L`` at fixed ``(lambda, mu)`` with a VJP-only optax
 rule (Adam by default; ``optax.lbfgs()`` works, its line search included).
-Gauss-Newton and Levenberg-Marquardt are out: they need JVPs, which jaccpot's
-checkpointed rollouts (``custom_vjp`` s) refuse.
+Gauss-Newton and Levenberg-Marquardt are not implemented (deferred, S10): the JVPs
+they need are now available -- jaccpot's ``ad_mode="forward"`` (main 1bb30620)
+gives its rollouts ``custom_jvp`` seams, the segment engines take an ``ad_mode``,
+and :class:`~mimirax.inference.parallel.ParallelSegmentObjective` has a
+``"jacfwd"`` program for the theta block of the segments' Jacobian -- but the
+solver itself (the node block, the damping, the linear solve) is not written.
 
 WHY THE LOOPS ARE IN PYTHON. Both loops run on the host, one jitted optax step
 per inner iteration, because a segment engine on jaccpot's fused lane needs the

@@ -446,6 +446,86 @@ def test_a_failed_check_re_prepares_and_redoes_the_step_in_parallel(keyed) -> No
         AugmentedLagrangian(max_redo=2, devices=_devices()).minimize(problem, params)
 
 
+# --- forward mode: the theta block by jax.jacfwd ------------------------------------
+
+
+@pytest.mark.parametrize(
+    "num_segments,output,free_initial,with_prior",
+    [
+        (3, "final", False, True),
+        (4, "segment_ends", False, False),
+        (3, "final", True, False),
+        (1, "final", False, False),
+    ],
+)
+def test_the_jacfwd_programs_give_the_theta_block_of_the_one_program(
+    num_segments, output, free_initial, with_prior
+) -> None:
+    """``theta_jacobian`` (one ``jax.jacfwd`` program per segment key) against
+    reverse mode on the single program: ``f`` and the defects to round-off,
+    ``df/dtheta`` against ``jax.grad`` and ``d defects / d theta`` against
+    ``jax.jacrev``; traced once per key, not again on a second call."""
+    priors = (GaussianPrior(mean=0.5, sigma=2.0),) if with_prior else ()
+    problem, params = _problem(
+        num_segments=num_segments,
+        output=output,
+        free_initial=free_initial,
+        priors=priors,
+    )
+    objective = ParallelSegmentObjective(problem, _devices())
+    f, grad, defects, jac_defects, auxes = objective.theta_jacobian(params)
+    assert len(auxes) == num_segments
+
+    def evaluate(theta):
+        return problem.evaluate({"theta": theta, "nodes": params["nodes"]})
+
+    reference = evaluate(params["theta"])
+    assert _max_relative(f, reference.negative_log_posterior) < 1e-14
+    assert _max_relative(defects, reference.defects[0]) < 1e-14
+    want_grad = jax.jit(jax.grad(lambda th: evaluate(th).negative_log_posterior))(
+        params["theta"]
+    )
+    want_jac = jax.jit(jax.jacrev(lambda th: evaluate(th).defects[0]))(params["theta"])
+    assert jax.tree_util.tree_structure(grad) == jax.tree_util.tree_structure(want_grad)
+    assert _max_relative(grad, want_grad) < 1e-12
+    assert _max_relative(jac_defects, want_jac) < 1e-12
+    if num_segments > 1:
+        assert float(jnp.max(jnp.abs(jac_defects["k"]))) > 0.0
+    traces = objective.num_jacfwd_traces
+    assert traces == len({k for k in objective._programs if k[0] == "jacfwd"})
+    objective.theta_jacobian(params)
+    assert objective.num_jacfwd_traces == traces
+    assert objective.num_traces == 0 and objective.num_forward_traces == 0
+
+
+def test_the_jacfwd_programs_match_central_differences() -> None:
+    """``d defects / d theta`` against central differences of the defects."""
+    problem, params = _problem(num_segments=3)
+    objective = ParallelSegmentObjective(problem, _devices())
+    _, _, _, jac_defects, _ = objective.theta_jacobian(params)
+    h = 1e-6
+    k = params["theta"]["k"]
+    plus = {"theta": {"k": k + h}, "nodes": params["nodes"]}
+    minus = {"theta": {"k": k - h}, "nodes": params["nodes"]}
+    fd = (
+        objective.evaluate(plus).defects[0] - objective.evaluate(minus).defects[0]
+    ) / (2 * h)
+    assert _max_relative(jac_defects["k"], fd) < 1e-7
+
+
+def test_the_jacfwd_programs_refuse_a_vjp_only_engine() -> None:
+    """A ``custom_vjp`` segment (jaccpot's checkpointed reverse) has no JVP."""
+    engine = VerletSegmentEngine(
+        segment_steps=(4, 4), dt=0.02, field=harmonic, vjp_only=True
+    )
+    problem, params = _problem(num_segments=2, engine=engine)
+    objective = ParallelSegmentObjective(problem, _devices())
+    with pytest.raises(TypeError, match="custom_vjp"):
+        objective.theta_jacobian(params)
+    with pytest.raises(ValueError, match="unknown program kind"):
+        objective._program("hessian", 0)
+
+
 def test_bound_engine_forwards_the_arrays() -> None:
     calls = []
 

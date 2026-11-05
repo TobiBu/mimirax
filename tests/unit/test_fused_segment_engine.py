@@ -318,6 +318,59 @@ def test_start_force_is_passed_to_the_plans_rollout_only_when_asked():
         FusedSegmentEngine(_Runner(), (1,), dt=0.1, start_force="inside")
 
 
+def test_ad_mode_reaches_the_plans_rollout_as_jaccpots_override():
+    """``ad_mode="forward"``: ``plan.rollout`` runs inside jaccpot's
+    ``ad_mode_override("forward")`` with ``checkpoint=None`` (the plain scan), and
+    a jvp / jacfwd goes through the segment (the input barriers carry it);
+    ``None`` installs nothing (the engine's checkpoint, the ambient mode);
+    ``"forward"`` refuses a reverse-pass schedule and ``inner_steps``."""
+    pytest.importorskip("jaccpot.runtime.grad_options")
+    from jaccpot.runtime.grad_options import resolve_ad_mode
+
+    seen = []
+
+    class _Plan(_FakePlan):
+        def rollout(self, inputs, **kwargs):
+            seen.append((resolve_ad_mode(), kwargs.get("checkpoint")))
+            return super().rollout(inputs, **kwargs)
+
+    class _Runner(_FakeRunner):
+        def gradient_plan(
+            self, state, masses, *, dt, num_steps, force_params, external_params
+        ):
+            del force_params
+            return _Plan(state, masses, dt, num_steps, external_params, self.slack)
+
+    x, v, m = _system()
+    theta = {"k": jnp.asarray(1.0)}
+    for mode, want in ((None, ("reverse", "step")), ("forward", ("forward", None))):
+        engine = FusedSegmentEngine(_Runner(), (2,), dt=0.1, ad_mode=mode)
+        engine.propagate(theta, x, v, m)
+        seen.clear()
+
+        def final(t, e=engine):
+            return e(t, x, v, m, 0).positions
+
+        out, tangent = jax.jit(lambda t, d: jax.jvp(final, (t,), (d,)))(
+            theta, {"k": jnp.asarray(1.0)}
+        )
+        assert seen == [want]
+        jac = jax.jit(jax.jacfwd(final))(theta)
+        h = 1e-6
+        fd = (final({"k": 1.0 + h}) - final({"k": 1.0 - h})) / (2 * h)
+        assert jnp.allclose(tangent, fd, rtol=1e-6, atol=1e-9)
+        assert jnp.allclose(jac["k"], tangent, rtol=1e-12, atol=0.0)
+    for kwargs, match in (
+        (dict(checkpoint="nested"), "plain scan"),
+        (dict(inner_steps=2), "inner_steps"),
+        (dict(checkpoint="offload"), "plain scan"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            FusedSegmentEngine(_Runner(), (1,), dt=0.1, ad_mode="forward", **kwargs)
+    with pytest.raises(ValueError, match="ad_mode must be"):
+        FusedSegmentEngine(_Runner(), (1,), dt=0.1, ad_mode="jvp")
+
+
 def test_segment_arrays_are_the_plans_arrays_where_jaccpot_offers_them():
     """A plan with jaccpot's ``GradientPlan.arrays`` / ``rollout(arrays=)``: the
     engine's ``segment_arrays`` are the plan's own (placed once per plan and

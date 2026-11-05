@@ -14,8 +14,11 @@ the rollout's ``external_args``. CPU, float64, ``N`` 32-64. The gates:
    against single shooting;
 4. the augmented Lagrangian's gradient in theta and in the nodes against
    central finite differences;
-5. VJP-only: forward mode through a segment raises, and the driver's step is
-   traced once.
+5. forward mode: with ``ad_mode="forward"`` (jaccpot main 1bb30620) ``jax.jvp``
+   / ``jax.jacfwd`` run through a ``checkpoint="step"`` segment and match the
+   reverse VJP and central differences; the default (reverse) segment still
+   refuses a jvp, so the drivers' paths are VJP-only; the driver's step is traced
+   once.
 
 Measured numbers are quoted in the tests that use them (this machine, jax
 0.11.2, jaccpot ``s9/session2`` 342d75f9).
@@ -344,16 +347,64 @@ def test_augmented_lagrangian_gradient_against_finite_differences() -> None:
     assert abs(float(fd - ad)) / abs(float(ad)) < 1e-8
 
 
-# --- gate 5: VJP only -------------------------------------------------------------
+# --- gate 5: forward mode (jaccpot ad_mode="forward") -------------------------------
 
 
-def test_forward_mode_is_refused_through_a_checkpointed_segment() -> None:
-    """``checkpoint="step"`` is a ``custom_vjp``: ``jax.jvp`` through it raises.
+def _theta_direction():
+    return {"log_mass": jnp.asarray(0.7), "log_scale": jnp.asarray(-0.4)}
 
-    So every driver run above (whose engine is checkpointed) proves its path is
-    VJP-only. The plain-scan engine (``checkpoint=None``) is the control: there
-    forward mode goes through.
-    """
+
+def test_forward_mode_runs_through_a_segment() -> None:
+    """``ad_mode="forward"`` (jaccpot main 1bb30620): ``jax.jvp`` through a
+    ``checkpoint="step"`` segment runs -- the plain scan -- with the reverse
+    engine's forward as its primal, its tangent the reverse VJP's transpose
+    (``<w, J d> == <J^T w, d>``) and central differences' along ``d``. The same
+    with the default engine (``ad_mode=None``) traced inside
+    ``ad_mode_override("forward")``, and ``jax.jacfwd`` equals ``jax.jacrev``."""
+    from jaccpot.runtime.grad_options import ad_mode_override
+
+    model, *_ = _model(32, (3, 3))
+    forward, *_ = _model(32, (3, 3), ad_mode="forward")
+    nodes = model.init_nodes(TRUTH)
+
+    def final_of(m):
+        def final(theta):
+            return _phase_space(m({"theta": theta, "nodes": nodes}))
+
+        return final
+
+    d = _theta_direction()
+    out, tangent = jax.jit(lambda th, t: jax.jvp(final_of(forward), (th,), (t,)))(
+        TRUTH, d
+    )
+    reference, pullback = jax.vjp(final_of(model), TRUTH)
+    assert _relative(out, reference) < 1e-14
+    w = jax.random.normal(jax.random.PRNGKey(5), reference.shape)
+    (cotangent,) = pullback(w)
+    adjoint = sum(float(cotangent[k] * d[k]) for k in d)
+    assert abs(float(jnp.vdot(w, tangent)) - adjoint) <= 1e-12 * abs(adjoint)
+    h = 1e-6
+    value = jax.jit(final_of(model))
+    plus = {k: TRUTH[k] + h * d[k] for k in d}
+    minus = {k: TRUTH[k] - h * d[k] for k in d}
+    fd = (value(plus) - value(minus)) / (2 * h)
+    assert _relative(tangent, fd) < 1e-7
+    with ad_mode_override("forward"):
+        _, ambient = jax.jit(lambda th, t: jax.jvp(final_of(model), (th,), (t,)))(
+            TRUTH, d
+        )
+        jac_fwd = jax.jit(jax.jacfwd(final_of(model)))(TRUTH)
+    assert _relative(ambient, tangent) < 1e-14
+    jac_rev = jax.jit(jax.jacrev(final_of(model)))(TRUTH)
+    for k in TRUTH:
+        assert _relative(jac_fwd[k], jac_rev[k]) < 1e-12, k
+
+
+def test_what_forward_mode_still_refuses() -> None:
+    """Reverse mode stays the default: ``jax.jvp`` through the default
+    (``custom_vjp``) segment raises outside an override, so every driver run above
+    proves its path is VJP-only; ``ad_mode="forward"`` refuses the reverse-pass
+    storage schedules (``"nested"``, ``"offload"``) and an unknown mode."""
     model, *_ = _model(32, (3, 3))
     params = {"theta": TRUTH, "nodes": model.init_nodes(TRUTH)}
 
@@ -362,6 +413,13 @@ def test_forward_mode_is_refused_through_a_checkpointed_segment() -> None:
 
     with pytest.raises(TypeError, match="custom_vjp"):
         jax.jvp(final_positions, (TRUTH,), (TRUTH,))
+    for checkpoint in ("nested", "offload"):
+        with pytest.raises(ValueError, match="plain scan"):
+            DirectSumSegmentEngine(
+                segment_steps=(3,), dt=DT, checkpoint=checkpoint, ad_mode="forward"
+            )
+    with pytest.raises(ValueError, match="ad_mode must be"):
+        DirectSumSegmentEngine(segment_steps=(3,), dt=DT, ad_mode="both")
     plain, *_ = _model(32, (3, 3), checkpoint=None)
     out, tangent = jax.jvp(
         lambda th: plain({"theta": th, "nodes": params["nodes"]})["positions"],

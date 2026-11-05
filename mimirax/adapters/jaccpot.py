@@ -14,8 +14,20 @@ MULTIPLE SHOOTING. :class:`DirectSumSegmentEngine` is a
 (``jaccpot.runtime.grad_rollout.differentiable_rollout``, S9) over its direct
 sum: production velocity Verlet, a hand-written checkpointed reverse
 (``checkpoint="step"``: a ``custom_vjp``, so forward-mode autodiff through it
-fails loudly), the external field's parameters ``theta`` as the rollout's
-``external_args``. It is the oracle the fused-lane engine is checked against.
+fails loudly in the default ``ad_mode``), the external field's parameters
+``theta`` as the rollout's ``external_args``. It is the oracle the fused-lane
+engine is checked against.
+
+FORWARD MODE. Both engines take an ``ad_mode`` (jaccpot's, main 1bb30620 on):
+``"forward"`` traces each segment for ``jax.jvp`` / ``jax.jacfwd`` /
+``jax.linearize`` -- a plain scan (``checkpoint`` ``None`` or ``"step"``; the
+reverse-pass schedules ``"nested"`` / ``"offload"`` are refused) over the fused
+lane's ``custom_jvp`` seams, the primal the production forward bit for bit, first
+order only (no ``jax.grad`` of it, no ``jacfwd(jacfwd)``). ``None`` (the default)
+follows an enclosing ``jaccpot.runtime.grad_options.ad_mode_override``, then
+``JACCPOT_GRAD_AD_MODE``, then reverse: one engine (and its fused plans) serves
+the reverse objective and, traced inside ``ad_mode_override("forward")``, the
+forward-mode one (``mimirax.inference.parallel``'s ``"jacfwd"`` programs).
 
 :class:`FusedSegmentEngine` is the :class:`~mimirax.shooting.SegmentEngine` on
 jaccpot's fused PRODUCTION lane (S10): each segment a gradient run of jaccpot's
@@ -68,6 +80,7 @@ payload, and it is dropped unless ``keep_forward``.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import inspect
 import time
@@ -269,6 +282,12 @@ class DirectSumSegmentEngine:
         ``differentiable_rollout``'s checkpoint mode: ``"step"`` (default),
         ``"nested"``, ``"offload"``, or ``None`` (a plain scan, which plain
         autodiff -- forward mode included -- goes through).
+    ad_mode : str | None
+        ``differentiable_rollout``'s ``ad_mode``: ``"reverse"``, ``"forward"``
+        (``jax.jvp`` / ``jax.jacfwd`` through the segment: a plain scan, so
+        ``checkpoint`` must be ``None`` or ``"step"``), or ``None`` (default:
+        an enclosing ``ad_mode_override``, then ``JACCPOT_GRAD_AD_MODE``, then
+        reverse; the argument is then not passed, as before it existed).
     """
 
     segment_steps: tuple[int, ...]
@@ -278,19 +297,23 @@ class DirectSumSegmentEngine:
     softening: float = 0.0
     softening_kernel: str | None = None
     checkpoint: str | None = "step"
+    ad_mode: str | None = None
 
     def __post_init__(self) -> None:
-        """Validate the segment lengths.
+        """Validate the segment lengths and the AD mode.
 
         Raises
         ------
         ValueError
-            If ``segment_steps`` is empty or holds a non-positive count.
+            If ``segment_steps`` is empty or holds a non-positive count, or
+            ``ad_mode`` is unknown or ``"forward"`` with a reverse-pass
+            ``checkpoint`` (``"nested"``, ``"offload"``).
         """
         if not self.segment_steps or any(int(s) < 1 for s in self.segment_steps):
             raise ValueError(
                 f"segment_steps must be positive step counts, got {self.segment_steps}"
             )
+        _check_ad_mode(self.ad_mode, self.checkpoint)
 
     @property
     def num_segments(self) -> int:
@@ -347,6 +370,9 @@ class DirectSumSegmentEngine:
             external_fn=external_fn,
             external_args=None if external_fn is None else theta,
             checkpoint=self.checkpoint,
+            # left out by default: the program (and a jaccpot before the
+            # argument) is what it was
+            **({} if self.ad_mode is None else {"ad_mode": self.ad_mode}),
         )
         return SegmentResult(result.positions, result.velocities, result.aux)
 
@@ -426,6 +452,58 @@ def _gradient_ok(bits: Any) -> bool:
     )
 
     return (int(np.asarray(bits)) & int(GRAD_FAIL_MASK)) == 0
+
+
+#: the AD modes an engine takes (jaccpot's ``ad_mode``); ``None`` follows the ambient
+AD_MODES = (None, "reverse", "forward")
+
+
+def _check_ad_mode(ad_mode: str | None, checkpoint: str | None) -> None:
+    """Validate an engine's ``ad_mode`` against its ``checkpoint``.
+
+    Parameters
+    ----------
+    ad_mode : str | None
+        One of :data:`AD_MODES`.
+    checkpoint : str | None
+        The engine's ``differentiable_rollout`` checkpoint mode.
+
+    Raises
+    ------
+    ValueError
+        If ``ad_mode`` is unknown, or ``"forward"`` comes with a reverse-pass
+        storage schedule (``"nested"`` / ``"offload"``): a jvp stores no residuals,
+        so forward mode is the plain scan (``None``, or ``"step"`` meaning it).
+    """
+    if ad_mode not in AD_MODES:
+        raise ValueError(f"ad_mode must be one of {AD_MODES}, got {ad_mode!r}")
+    if ad_mode == "forward" and checkpoint not in (None, "step"):
+        raise ValueError(
+            f"ad_mode='forward' runs the plain scan: checkpoint must be None or "
+            f"'step', got {checkpoint!r} (a reverse-pass storage schedule)"
+        )
+
+
+def _ad_mode_override(ad_mode: str | None) -> Any:
+    """jaccpot's ``ad_mode_override(ad_mode)``, or a null context for ``None``.
+
+    Parameters
+    ----------
+    ad_mode : str | None
+        The engine's AD mode.
+
+    Returns
+    -------
+    Any
+        A context manager.
+    """
+    if ad_mode is None:
+        return contextlib.nullcontext()
+    from jaccpot.runtime.grad_options import (  # pyright: ignore[reportMissingImports]
+        ad_mode_override,
+    )
+
+    return ad_mode_override(ad_mode)
 
 
 def _node_states(nodes: Any, count: int) -> list[tuple[Any, Any]]:
@@ -510,6 +588,17 @@ class FusedSegmentEngine:
         ``"nested"``, ``"offload"``, or ``None`` for a plain scan).
     inner_steps : Optional[int]
         Its ``inner_steps`` (``"nested"``).
+    ad_mode : Optional[str]
+        The AD mode each traced segment runs in: ``"forward"`` traces
+        ``plan.rollout`` inside jaccpot's ``ad_mode_override("forward")`` with
+        ``checkpoint=None`` (the plain scan ``GradientPlan.jvp`` / ``jacfwd``
+        run), for ``jax.jvp`` / ``jax.jacfwd`` through the segment;
+        ``"reverse"`` inside ``ad_mode_override("reverse")``; ``None`` (default)
+        installs nothing, so an enclosing override (or ``JACCPOT_GRAD_AD_MODE``)
+        decides and the program is what it was before the argument. With
+        ``"forward"``, ``checkpoint`` must be ``None`` or ``"step"`` and
+        ``inner_steps`` ``None``. The pre-passes (:meth:`prepare`) are forward
+        runs either way: one plan serves both modes.
     start_force : str
         Where each segment's start force runs, jaccpot's
         ``GradientPlan.rollout(start_force=...)``: ``"outside"`` (default) beside
@@ -565,12 +654,16 @@ class FusedSegmentEngine:
         force_params: Any = None,
         checkpoint: Optional[str] = "step",
         inner_steps: Optional[int] = None,
+        ad_mode: Optional[str] = None,
         start_force: str = "outside",
         keep_forward: bool = False,
     ) -> None:
         steps = tuple(int(s) for s in segment_steps)
         if not steps or min(steps) < 1:
             raise ValueError(f"segment_steps must be positive, got {steps}")
+        _check_ad_mode(ad_mode, checkpoint)
+        if ad_mode == "forward" and inner_steps is not None:
+            raise ValueError("ad_mode='forward' takes no inner_steps (no 'nested')")
         if start_force not in ("outside", "adjoint"):
             raise ValueError(
                 f"start_force must be 'outside' or 'adjoint', got {start_force!r}"
@@ -583,6 +676,7 @@ class FusedSegmentEngine:
         self.inner_steps = inner_steps
         self.start_force = start_force
         self.keep_forward = bool(keep_forward)
+        self.ad_mode = ad_mode
         self.plans: list = [None] * len(steps)
         self.ends: list = [None] * len(steps)
         #: each pre-pass's last f_b (``None`` without dehnen_error)
@@ -992,13 +1086,17 @@ class FusedSegmentEngine:
         }
         # the default leaves the argument out (a jaccpot before it)
         start = {} if self.start_force == "outside" else {"start_force": "adjoint"}
-        out = plan.rollout(
-            inputs,
-            checkpoint=self.checkpoint,
-            inner_steps=self.inner_steps,
-            **start,
-            **bound,
-        )
+        # forward mode: the plain scan of GradientPlan's own jvp / jacfwd, traced
+        # with the custom_jvp seams installed (the mode is read at trace time)
+        checkpoint = None if self.ad_mode == "forward" else self.checkpoint
+        with _ad_mode_override(self.ad_mode):
+            out = plan.rollout(
+                inputs,
+                checkpoint=checkpoint,
+                inner_steps=self.inner_steps,
+                **start,
+                **bound,
+            )
         f_b, bits, needs = out.aux
         aux = jax.lax.stop_gradient(
             (f_b, bits, needs, jnp.asarray(self._plan_ids[segment], jnp.int32))

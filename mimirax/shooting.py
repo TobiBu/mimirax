@@ -16,8 +16,11 @@ fused lane (session S10, track J), or the pure-JAX double in
 :mod:`mimirax.testing`. An engine is a traceable, differentiable map
 ``(theta, x, v, masses, segment) -> (x', v', aux)``; ``theta`` (the external
 field's parameters) enters the force ONLY as an argument, never closed over,
-because jaccpot's checkpointed rollouts are ``custom_vjp`` s that refuse closures
-over differentiated values. The ``aux`` is engine-specific and never
+because jaccpot's checkpointed rollouts are ``custom_vjp`` s (reverse mode, the
+default) that refuse closures over differentiated values. Forward mode (jaccpot's
+``ad_mode="forward"``, an engine's ``ad_mode``) is a plain scan over ``custom_jvp``
+seams that would accept a closure, but the convention keeps one engine serving
+both modes. The ``aux`` is engine-specific and never
 differentiated (jaccpot's aux guard refuses a cotangent into it).
 
 Two optional capabilities, found by ``hasattr`` (the convention of

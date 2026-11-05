@@ -24,7 +24,11 @@ from mimirax.inference.hmc import HMC, NUTS
 from mimirax.inference.m2m import MadeToMeasure, made_to_measure
 from mimirax.inference.objective import InferenceProblem, ProblemEvaluation
 from mimirax.inference.optimizers import OptaxOptimizer, adam
-from mimirax.inference.parallel import ParallelSegmentObjective, SegmentContribution
+from mimirax.inference.parallel import (
+    ParallelSegmentObjective,
+    SegmentContribution,
+    SegmentJacobian,
+)
 from mimirax.inference.resampling import DataResampling
 from mimirax.inference.vi import MeanFieldVI
 
@@ -44,6 +48,7 @@ __all__ = [
     "ParallelSegmentObjective",
     "ProblemEvaluation",
     "SegmentContribution",
+    "SegmentJacobian",
     "adam",
     "augmented_lagrangian_value",
     "defect_violation",

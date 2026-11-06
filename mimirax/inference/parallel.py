@@ -29,6 +29,19 @@ arrays (``segment_arrays``: the fused lane's plan parameters and seeds) are
 ARGUMENTS, placed on their segment's device once (the engine's arrays once per
 plan), never constants of the program.
 
+FORWARD MODE (``"jacfwd"``). :meth:`ParallelSegmentObjective.dispatch_jacfwd`
+runs, per segment, ``jax.jacfwd`` in ``theta`` of the segment's negative log
+likelihood and end state: the THETA BLOCK of the segments' Jacobian (one tangent
+per parameter, so cheap for a few parameters, memory flat in the steps), what a
+Gauss-Newton step on the defects needs beside the node blocks (``d c_k / d theta =
+-d end_k / d theta``). :meth:`ParallelSegmentObjective.theta_jacobian` assembles
+it. The engine must carry a JVP: a pure one (``mimirax.testing``'s
+``VerletSegmentEngine``), a jaccpot engine with ``ad_mode="forward"``, or one with
+``ad_mode=None`` dispatched inside jaccpot's ``ad_mode_override("forward")`` (the
+mode is read at trace time and is part of ``jax.jit``'s cache key, so the same
+engine's reverse programs are unaffected). A ``custom_vjp`` engine (jaccpot's
+checkpointed reverse) refuses it with jax's ``TypeError``.
+
 ROUND-OFF. Against the single program (the whole objective in one
 ``jax.value_and_grad``) the split sums the same terms in a different order: the
 theta gradient is ``sum_k g_k`` in segment order where autodiff accumulates it in
@@ -55,7 +68,7 @@ from mimirax._typing import PyTree, Scalar
 from mimirax.inference.objective import InferenceProblem, ProblemEvaluation
 from mimirax.shooting import segment_key
 
-__all__ = ["ParallelSegmentObjective", "SegmentContribution"]
+__all__ = ["ParallelSegmentObjective", "SegmentContribution", "SegmentJacobian"]
 
 
 class SegmentContribution(NamedTuple):
@@ -88,6 +101,35 @@ class SegmentContribution(NamedTuple):
     grad_theta: PyTree
     grad_start: PyTree
     grad_next: PyTree
+
+
+class SegmentJacobian(NamedTuple):
+    """One segment's forward pieces and the theta block of its Jacobian.
+
+    What a ``"jacfwd"`` program returns (forward mode, ``jax.jacfwd`` in
+    ``theta``).
+
+    Attributes
+    ----------
+    negative_log_likelihood : Array
+        ``-term(end_k, observations_k)``; ``0`` for a segment without data.
+    defect : Array | None
+        ``[N, 6]`` ``c_k``; ``None`` for the last segment.
+    end : Array
+        ``[N, 6]`` end state (positions then velocities).
+    jac_nll : PyTree
+        d(negative_log_likelihood)/d(theta), in ``theta`` 's structure (zeros
+        for a segment without data).
+    jac_end : PyTree
+        d(end)/d(theta): ``theta`` 's structure, each leaf ``[N, 6, *leaf.shape]``.
+        The defect's is its negative.
+    """
+
+    negative_log_likelihood: Array
+    defect: Array | None
+    end: Array
+    jac_nll: PyTree
+    jac_end: PyTree
 
 
 def _reduce_add(values: Sequence[Any]) -> Any:
@@ -135,6 +177,8 @@ class ParallelSegmentObjective:
         per key a re-plan or :meth:`refresh` made).
     num_forward_traces : int
         Traces of the forward-only programs (:meth:`dispatch_forward`).
+    num_jacfwd_traces : int
+        Traces of the forward-mode Jacobian programs (:meth:`dispatch_jacfwd`).
 
     Raises
     ------
@@ -147,6 +191,7 @@ class ParallelSegmentObjective:
     segment_devices: tuple
     num_traces: int
     num_forward_traces: int
+    num_jacfwd_traces: int
 
     def __init__(self, problem: InferenceProblem, devices: Sequence[Any]) -> None:
         devices = tuple(devices)
@@ -160,9 +205,11 @@ class ParallelSegmentObjective:
         self.segment_devices = tuple(devices[k % len(devices)] for k in range(count))
         self.num_traces = 0
         self.num_forward_traces = 0
+        self.num_jacfwd_traces = 0
         self._programs: dict[tuple, Callable[..., Any]] = {}
         self._assemble = jax.jit(self.assemble)
         self._assemble_forward = jax.jit(self.assemble_forward)
+        self._assemble_jacfwd = jax.jit(self.assemble_jacfwd)
         # placed ONCE (the engine's per-plan arrays are placed by the engine)
         masses = jnp.asarray(self.model.masses)
         self._masses = {
@@ -234,7 +281,7 @@ class ParallelSegmentObjective:
         Parameters
         ----------
         kind : str
-            ``"value_and_grad"`` or ``"forward"``.
+            ``"value_and_grad"``, ``"forward"`` or ``"jacfwd"``.
         segment : int
             The segment.
 
@@ -275,6 +322,79 @@ class ParallelSegmentObjective:
     # ------------------------------------------------------------------
     # The programs.
     # ------------------------------------------------------------------
+
+    def _segment_terms(
+        self,
+        segment: int,
+        has_next: bool,
+        observed: bool,
+        theta: PyTree,
+        start: dict,
+        following: Any,
+        masses: Array,
+        observations: Any,
+        arrays: Any,
+    ) -> tuple:
+        """One segment's run, its likelihood term and its defect, traced.
+
+        Parameters
+        ----------
+        segment : int
+            The segment the program is traced for (its key's first segment).
+        has_next : bool
+            Whether a node follows (a defect).
+        observed : bool
+            Whether the segment carries a likelihood term.
+        theta : PyTree
+            The field's parameters.
+        start : dict
+            ``{"positions", "velocities"}`` start state.
+        following : Any
+            The next node, or ``None``.
+        masses : Array
+            ``[N]`` masses.
+        observations : Any
+            The segment's observations, or ``None``.
+        arrays : Any
+            The engine's arrays for the segment, or ``None``.
+
+        Returns
+        -------
+        tuple
+            ``(end, nll, defect, zero)``: the engine's
+            :class:`~mimirax.shooting.SegmentResult`, ``-term`` (``zero``
+            without data), the ``[N, 6]`` defect (``None`` without a next node),
+            and a zero of the state's dtype.
+        """
+        engine = self.model.engine
+        if arrays is None:
+            end = engine(
+                theta, start["positions"], start["velocities"], masses, segment
+            )
+        else:
+            end = engine(
+                theta,
+                start["positions"],
+                start["velocities"],
+                masses,
+                segment,
+                arrays=arrays,
+            )
+        zero = jnp.zeros((), jnp.result_type(end.positions))
+        nll = zero
+        if observed:
+            state = {"positions": end.positions, "velocities": end.velocities}
+            nll = -self.split.term(state, observations)
+        defect = None
+        if has_next:
+            defect = jnp.concatenate(
+                [
+                    following["positions"] - end.positions,
+                    following["velocities"] - end.velocities,
+                ],
+                axis=-1,
+            )
+        return end, nll, defect, zero
 
     def _segment_value(
         self,
@@ -323,37 +443,21 @@ class ParallelSegmentObjective:
         tuple[Array, tuple]
             ``(value, (nll, multiplier, penalty, defect, aux))``.
         """
-        engine = self.model.engine
-        if arrays is None:
-            end = engine(
-                theta, start["positions"], start["velocities"], masses, segment
-            )
-        else:
-            end = engine(
-                theta,
-                start["positions"],
-                start["velocities"],
-                masses,
-                segment,
-                arrays=arrays,
-            )
-        zero = jnp.zeros((), jnp.result_type(end.positions))
-        nll = zero
-        if observed:
-            state = {"positions": end.positions, "velocities": end.velocities}
-            nll = -self.split.term(state, observations)
-        multiplier, penalty, defect = zero, zero, None
-        if has_next:
-            defect = jnp.concatenate(
-                [
-                    following["positions"] - end.positions,
-                    following["velocities"] - end.velocities,
-                ],
-                axis=-1,
-            )
-            if lam is not None:
-                multiplier = jnp.sum(lam * defect)
-                penalty = 0.5 * mu * jnp.sum(defect * defect)
+        end, nll, defect, zero = self._segment_terms(
+            segment,
+            has_next,
+            observed,
+            theta,
+            start,
+            following,
+            masses,
+            observations,
+            arrays,
+        )
+        multiplier, penalty = zero, zero
+        if defect is not None and lam is not None:
+            multiplier = jnp.sum(lam * defect)
+            penalty = 0.5 * mu * jnp.sum(defect * defect)
         value = nll + multiplier + penalty
         return value, (nll, multiplier, penalty, defect, end.aux)
 
@@ -363,7 +467,7 @@ class ParallelSegmentObjective:
         Parameters
         ----------
         kind : str
-            ``"value_and_grad"`` or ``"forward"``.
+            ``"value_and_grad"``, ``"forward"`` or ``"jacfwd"``.
         segment : int
             The segment.
 
@@ -371,7 +475,14 @@ class ParallelSegmentObjective:
         -------
         Callable[..., Any]
             The jitted program; ``(theta, start, next, lam, mu, masses,
-            observations, arrays) -> (SegmentContribution, aux)``.
+            observations, arrays) -> (SegmentContribution, aux)``
+            (:class:`SegmentJacobian` for ``"jacfwd"``, which ignores ``lam`` and
+            ``mu``).
+
+        Raises
+        ------
+        ValueError
+            For an unknown ``kind``.
         """
         key = self._key(kind, segment)
         program = self._programs.get(key)
@@ -411,7 +522,29 @@ class ParallelSegmentObjective:
 
             program = jax.jit(value_and_grad_run)
 
-        else:
+        elif kind == "jacfwd":
+            terms = functools.partial(self._segment_terms, segment, has_next, observed)
+
+            def jacfwd_run(
+                theta, start, following, lam, mu, masses, observations, arrays
+            ):
+                del lam, mu  # the Jacobian of the forward pieces only
+                self.num_jacfwd_traces += 1  # runs at trace time only
+
+                def of(theta_):
+                    end, nll, defect, _ = terms(
+                        theta_, start, following, masses, observations, arrays
+                    )
+                    rows = jnp.concatenate([end.positions, end.velocities], axis=-1)
+                    return (nll, rows), (nll, defect, rows, end.aux)
+
+                (jac_nll, jac_end), pieces = jax.jacfwd(of, has_aux=True)(theta)
+                nll, defect, rows, aux = pieces
+                return SegmentJacobian(nll, defect, rows, jac_nll, jac_end), aux
+
+            program = jax.jit(jacfwd_run)
+
+        elif kind == "forward":
 
             def forward_run(
                 theta, start, following, lam, mu, masses, observations, arrays
@@ -429,6 +562,12 @@ class ParallelSegmentObjective:
                 )
 
             program = jax.jit(forward_run)
+
+        else:
+            raise ValueError(
+                f"unknown program kind {kind!r}: 'value_and_grad', 'forward' or "
+                "'jacfwd'"
+            )
 
         self._programs[key] = program
         return program
@@ -472,11 +611,11 @@ class ParallelSegmentObjective:
         Parameters
         ----------
         kind : str
-            ``"value_and_grad"`` or ``"forward"``.
+            ``"value_and_grad"``, ``"forward"`` or ``"jacfwd"``.
         params : PyTree
             ``{"theta", "nodes"}``.
         multipliers : Any
-            ``[S-1, N, 6]`` multipliers, or ``None`` (forward).
+            ``[S-1, N, 6]`` multipliers, or ``None`` (forward, jacfwd).
         mu : Any
             The penalty, or ``None`` (forward).
 
@@ -560,6 +699,27 @@ class ParallelSegmentObjective:
             penalty terms, which are zero).
         """
         contributions, auxes = self._dispatch("forward", params, None, None)
+        return jax.device_put(contributions, self.home), auxes
+
+    def dispatch_jacfwd(self, params: PyTree) -> tuple[tuple, tuple]:
+        """Dispatch every segment's forward-mode Jacobian program. Host, asynchronous.
+
+        ``jax.jacfwd`` in ``theta`` of each segment's likelihood term and end
+        state (module docstring, FORWARD MODE): the engine must carry a JVP.
+
+        Parameters
+        ----------
+        params : PyTree
+            ``{"theta", "nodes"}``.
+
+        Returns
+        -------
+        tuple[tuple, tuple]
+            The ``S`` :class:`SegmentJacobian` s, copied to the home device, and
+            the ``S`` auxes, on their segment's device (for the engine's
+            ``check``).
+        """
+        contributions, auxes = self._dispatch("jacfwd", params, None, None)
         return jax.device_put(contributions, self.home), auxes
 
     # ------------------------------------------------------------------
@@ -682,6 +842,71 @@ class ParallelSegmentObjective:
         """
         f, _ = self._objective(params, contributions)
         return f, self._defects(params, contributions)
+
+    def assemble_jacfwd(
+        self, params: PyTree, contributions: Sequence[SegmentJacobian]
+    ) -> tuple[Scalar, PyTree, Array, PyTree]:
+        """Sum the Jacobian programs' pieces into the theta block. Pure.
+
+        Parameters
+        ----------
+        params : PyTree
+            ``{"theta", "nodes"}``.
+        contributions : Sequence[SegmentJacobian]
+            What :meth:`dispatch_jacfwd` returned.
+
+        Returns
+        -------
+        tuple[Scalar, PyTree, Array, PyTree]
+            ``(f, df/dtheta, defects, d defects/d theta)``: ``f`` the
+            unconstrained objective (priors included, their theta gradient
+            too), the gradient in ``theta`` 's structure (forward mode: one
+            tangent per parameter), the defects ``[S-1, N, 6]``, and their
+            Jacobian in ``theta`` 's structure, each leaf ``[S-1, N, 6,
+            *leaf.shape]`` (``-d end_k / d theta``).
+        """
+        f, prior_grad = self._objective(params, contributions)
+        grad = _reduce_add(
+            [contributions[k].jac_nll for k in self.split.observed_segments]
+        )
+        if prior_grad is not None:
+            grad = jax.tree_util.tree_map(operator.add, grad, prior_grad["theta"])
+        theta = params["theta"]
+        if self.num_segments == 1:
+            (shape,) = self.defect_shapes(params)
+            jac_defects = jax.tree_util.tree_map(
+                lambda leaf: jnp.zeros((*shape.shape, *jnp.shape(leaf)), shape.dtype),
+                theta,
+            )
+        else:
+            jac_defects = jax.tree_util.tree_map(
+                lambda *leaves: -jnp.stack(leaves),
+                *[c.jac_end for c in contributions[:-1]],
+            )
+        return f, grad, self._defects(params, contributions), jac_defects
+
+    def theta_jacobian(
+        self, params: PyTree
+    ) -> tuple[Scalar, PyTree, Array, PyTree, tuple]:
+        """The theta block, by forward mode: dispatch, then a jitted assembly.
+
+        Parameters
+        ----------
+        params : PyTree
+            ``{"theta", "nodes"}``.
+
+        Returns
+        -------
+        tuple[Scalar, PyTree, Array, PyTree, tuple]
+            ``(f, df/dtheta, defects, d defects/d theta, auxes)``
+            (:meth:`assemble_jacfwd`, and the ``S`` segment auxes for the
+            engine's ``check``).
+        """
+        contributions, auxes = self.dispatch_jacfwd(params)
+        f, grad, defects, jac_defects = self._assemble_jacfwd(
+            jax.device_put(params, self.home), contributions
+        )
+        return f, grad, defects, jac_defects, auxes
 
     # ------------------------------------------------------------------
     # Conveniences (one call: dispatch, then a jitted assembly).

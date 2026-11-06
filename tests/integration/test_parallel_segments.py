@@ -170,6 +170,52 @@ def test_direct_sum_parallel_step_equals_the_one_program(num_segments) -> None:
     assert _differ(grads["nodes"], old_grads["nodes"])[1] < 1e-15
 
 
+@pytest.mark.parametrize("ambient", [False, True], ids=["engine", "override"])
+def test_direct_sum_theta_jacobian_by_forward_mode(ambient) -> None:
+    """The ``"jacfwd"`` programs (jaccpot ``ad_mode="forward"``, main 1bb30620)
+    on the direct sum, 3 segments: ``df/dtheta`` and ``d defects / d theta``
+    against reverse mode on the one program (the default ``checkpoint="step"``
+    engine). The forward-mode engine is either ``ad_mode="forward"`` or the
+    default engine dispatched inside ``ad_mode_override("forward")``; the
+    same objective's reverse programs run beside it, unchanged."""
+    from jaccpot.runtime.grad_options import ad_mode_override
+
+    problem, params, lam = _direct_problem(3)
+    if not ambient:
+        engine = dataclasses.replace(problem.forward.engine, ad_mode="forward")
+        model = dataclasses.replace(problem.forward, engine=engine)
+        problem = dataclasses.replace(problem, forward=model)
+    objective = ParallelSegmentObjective(problem, _devices())
+    if ambient:
+        with ad_mode_override("forward"):
+            f, grad, defects, jac, _ = objective.theta_jacobian(params)
+    else:
+        f, grad, defects, jac, _ = objective.theta_jacobian(params)
+
+    def evaluate(theta):
+        return problem.evaluate({"theta": theta, "nodes": params["nodes"]})
+
+    reference = evaluate(params["theta"])
+    assert _differ(f, reference.negative_log_posterior)[1] < 1e-14
+    assert _differ(defects, reference.defects[0])[1] < 1e-14
+    want_grad = jax.jit(jax.grad(lambda th: evaluate(th).negative_log_posterior))(
+        params["theta"]
+    )
+    want_jac = jax.jit(jax.jacrev(lambda th: evaluate(th).defects[0]))(params["theta"])
+    _report(
+        f"theta block by jacfwd ({'override' if ambient else 'engine'})",
+        grad=_differ(grad, want_grad),
+        jac=_differ(jac, want_jac),
+    )
+    assert _differ(grad, want_grad)[1] < 1e-12
+    assert _differ(jac, want_jac)[1] < 1e-12
+    # the reverse programs of the same objective, after the forward ones
+    value, grads = _one_program(problem, params, lam, jnp.asarray(10.0))
+    got_value, got_grads, _ = objective.value_and_grad(params, lam, jnp.asarray(10.0))
+    assert _differ(got_grads, grads)[1] < 1e-14
+    assert objective.num_jacfwd_traces == 2 and objective.num_traces == 2
+
+
 @pytest.mark.parametrize("num_segments", [2, 4])
 def test_direct_sum_driver_in_parallel(num_segments) -> None:
     """Two outer x 5 inner Adam steps; params, traces and the histories.

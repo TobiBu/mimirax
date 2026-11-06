@@ -25,7 +25,11 @@ Plummer lane (geometric MAC) and under ``dehnen_error``:
   alone, ``prepare`` re-plans it alone, a program traced on the replaced plan is
   refused and the redo passes;
 * the aux guard -- a loss that reads the engine's aux (behind ``stop_gradient``)
-  traces its gradient; the same through the raw rollout aux is refused.
+  traces its gradient; the same through the raw rollout aux is refused;
+* forward mode (Plummer lane) -- ``jax.jvp`` in theta through segment 0 under
+  ``ad_mode_override("forward")`` and with ``ad_mode="forward"``: the primal the
+  runner's end bitwise, the tangent the reverse gradient's transpose and central
+  differences'.
 
 MANUAL: a lane takes 16.5 GB (Plummer) / 20.6 GB (``dehnen_error``) of peak RSS
 and ~25 min on a loaded CPU host (its programs: the forward, the composed and
@@ -714,3 +718,64 @@ def test_reading_the_engines_aux_does_not_trip_the_aux_guard_dehnen_error():
 
     with pytest.raises(ValueError, match="reads the rollout's aux"):
         jax.jit(jax.grad(through_raw)).lower(_theta())
+
+
+# ---------------------------------------------------------------------------
+# Forward mode (jaccpot ad_mode="forward", main 1bb30620).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xdist_group("fused_segment_plummer")
+def test_forward_mode_through_a_fused_segment_plummer():
+    """``jax.jvp`` in theta through segment 0 on the fused lane, both routes: the
+    planned engine traced inside ``ad_mode_override("forward")`` (``ad_mode=None``,
+    its ``checkpoint="step"``) and a copy with ``ad_mode="forward"`` (the plan's
+    rollout under the override, ``checkpoint=None``) -- same plans, no pre-pass.
+    The primal is the runner's end from node 0 bitwise, the two tangents agree to
+    round-off, and the tangent is the reverse gradient's transpose (the engine's
+    ``jax.grad``) and matches central differences of the same plan."""
+    from jaccpot.runtime.grad_options import ad_mode_override
+
+    engine, _ = _engine("plummer")
+    forward = copy.copy(engine)
+    forward.ad_mode = "forward"
+    x0, v0, m, w = _system()
+
+    def loss_of(eng: Any) -> Any:
+        def loss(theta: Any) -> Any:
+            end = eng(theta, x0, v0, m, 0)
+            return jnp.sum(w * end.positions) + jnp.sum(w * end.velocities), end
+
+        return loss
+
+    d = {"k": jnp.asarray(1.0, jnp.float64)}
+    begun = time.perf_counter()
+    with ad_mode_override("forward"):
+        (value, end), (tangent, _) = jax.jit(
+            lambda t, dt: jax.jvp(loss_of(engine), (t,), (dt,))
+        )(_theta(), d)
+    (value_f, _), (tangent_f, _) = jax.jit(
+        lambda t, dt: jax.jvp(loss_of(forward), (t,), (dt,))
+    )(_theta(), d)
+    _report(
+        "plummer", "forward mode (2 jvp programs)", seconds=time.perf_counter() - begun
+    )
+    from mimirax.adapters.jaccpot import _gradient_ok
+
+    assert _gradient_ok(end.aux[1])
+    got = jnp.stack([end.positions, end.velocities], axis=1)
+    assert _bitwise(got, engine.plans[0].forward.state) == 0
+    assert _bitwise(value_f, value) == 0
+    assert abs(float(tangent_f - tangent)) <= 1e-13 * abs(float(tangent))
+    grad = jax.jit(jax.grad(lambda t: loss_of(engine)(t)[0]))(_theta())
+    _report(
+        "plummer",
+        "forward vs reverse",
+        tangent=float(tangent),
+        reverse=float(grad["k"]),
+    )
+    assert abs(float(tangent) - float(grad["k"])) <= 1e-11 * abs(float(grad["k"]))
+    h = 1e-6
+    value_at = jax.jit(lambda t: loss_of(engine)(t)[0])
+    fd = (value_at({"k": K_EXT + h}) - value_at({"k": K_EXT - h})) / (2 * h)
+    assert abs(float(tangent - fd)) <= 1e-7 * abs(float(fd))

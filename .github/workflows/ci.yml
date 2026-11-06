@@ -78,18 +78,20 @@ jobs:
   # tests on jaccpot's direct sum, on CPU, in float64. The fused-lane tests are not
   # run in CI (they are manual gates on an A100).
   #
-  # PINS: the three mains (2026-11-03), after jaccpot #498 (the S10 follow-ups:
-  # `GradientPlan.rollout(start_force=)`, `GradientPlan.arrays`), nornax #23
-  # (`nornax.potentials`, `shooting_node` on a RebuildingForceModel) and yggdrax
-  # #106. Bump the three together: jaccpot's `yggdrax>=0.0.1` and jax window
-  # (>=0.11.2,<0.12) are what the resolver reconciles here.
+  # PINS: jaccpot main 1bb30620 (2026-11-05, #502: forward mode, `ad_mode=`, the
+  # `custom_jvp` seams the engines' `ad_mode="forward"` and the "jacfwd" programs
+  # use); nornax #23 (`nornax.potentials`, `shooting_node` on a
+  # RebuildingForceModel) and yggdrax #106 (ac87500, what jaccpot's forward-mode
+  # gates were measured on) unchanged. Bump the three together: jaccpot's
+  # `yggdrax>=0.0.1` and jax window (>=0.11.2,<0.12) are what the resolver
+  # reconciles here.
   solver-tests:
     runs-on: ubuntu-latest
     env:
       JAX_ENABLE_X64: "1"
       JAX_PLATFORMS: cpu
       YGGDRAX_REF: ac875003282e9e95c4b9e4427c56ae0a2e834181
-      JACCPOT_REF: 96122f6383b3254c350f08d61041143d1344c96a
+      JACCPOT_REF: 1bb30620f4486582d4787101adbf2809c854c054
       NORNAX_REF: dcf7796df86d28a6c0fb7e0a25e960d96d36bd05
 
     steps:
